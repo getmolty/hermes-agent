@@ -2496,3 +2496,58 @@ def list_picker_providers(
         filtered.append(p)
 
     return filtered
+
+
+
+def filter_providers_by_whitelist(
+    providers: List[dict],
+    whitelist: List[dict],
+) -> List[dict]:
+    """Filter a provider list to only models in a user-defined whitelist.
+
+    ``providers`` is the output of :func:`list_authenticated_providers` — a list
+    of dicts with ``slug`` and ``models`` keys.  ``whitelist`` is a list of
+    dicts with ``provider`` and ``model`` keys, read from
+    ``config.yaml`` → ``model.whitelist``.
+
+    Providers not referenced by any whitelist entry are dropped.  Within a
+    surviving provider, only models explicitly listed are kept.  The
+    ``total_models`` count is adjusted to reflect the filtered view.
+
+    Returns the filtered list.  If *whitelist* is empty the original
+    *providers* list is returned unchanged.
+    """
+    if not whitelist:
+        return providers
+
+    # Build lookup: provider_slug → set of allowed model IDs
+    allowed: dict[str, set[str]] = {}
+    for entry in whitelist:
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("provider", "")).strip()
+        model = str(entry.get("model", "")).strip()
+        if not provider or not model:
+            continue
+        allowed.setdefault(provider, set()).add(model)
+
+    if not allowed:
+        return providers
+
+    filtered: List[dict] = []
+    for provider in providers:
+        slug = provider.get("slug", "")
+        if slug not in allowed:
+            continue
+
+        models = provider.get("models", [])
+        kept = [m for m in models if m in allowed[slug]]
+        if not kept:
+            continue
+
+        entry = dict(provider)
+        entry["models"] = kept
+        entry["total_models"] = len(kept)
+        filtered.append(entry)
+
+    return filtered

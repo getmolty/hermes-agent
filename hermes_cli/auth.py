@@ -434,6 +434,14 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=(),
         base_url_env_var="BEDROCK_BASE_URL",
     ),
+    "crof": ProviderConfig(
+        id="crof",
+        name="CrofAI",
+        auth_type="api_key",
+        inference_base_url="https://crof.ai/v1",
+        api_key_env_vars=("CROF_API_KEY",),
+        base_url_env_var="CROF_BASE_URL",
+    ),
     "azure-foundry": ProviderConfig(
         id="azure-foundry",
         name="Azure Foundry",

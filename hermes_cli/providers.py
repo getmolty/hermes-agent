@@ -212,6 +212,13 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="https://ollama.com/v1",
         base_url_env_var="OLLAMA_BASE_URL",
     ),
+    "crof": HermesOverlay(
+        transport="openai_chat",
+        is_aggregator=True,
+        extra_env_vars=("CROF_API_KEY",),
+        base_url_override="https://crof.ai/v1",
+        base_url_env_var="CROF_BASE_URL",
+    ),
     # Azure Foundry: supports both OpenAI-style and Anthropic-style endpoints.
     # The transport is determined at runtime from config.yaml model.api_mode.
     "azure-foundry": HermesOverlay(
@@ -361,6 +368,10 @@ ALIASES: Dict[str, str] = {
     # upstage
     "solar": "upstage",
 
+    # crof
+    "crof-ai": "crof",
+    "crofai": "crof",
+
     # Local server aliases → virtual "local" concept (resolved via user config)
     "lmstudio": "lmstudio",
     "lm-studio": "lmstudio",
@@ -392,6 +403,7 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "bedrock": "AWS Bedrock",
     "ollama-cloud": "Ollama Cloud",
     "xai-oauth": "xAI Grok OAuth (SuperGrok / Premium+)",
+    "crof": "CrofAI",
 }
 
 

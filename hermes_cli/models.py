@@ -545,6 +545,13 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "us.meta.llama4-maverick-17b-instruct-v1:0",
         "us.meta.llama4-scout-17b-instruct-v1:0",
     ],
+    "crof": [
+        "deepseek-v4-pro",
+        "glm-5.1-precision",
+        "kimi-k2.6",
+        "glm-5.1",
+        "deepseek-v3.2",
+    ],
     # Azure Foundry: user-provided endpoint and model.
     # Empty list because models depend on the endpoint configuration.
     "azure-foundry": [],
@@ -1086,6 +1093,7 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("opencode-zen",   "OpenCode Zen",             "OpenCode Zen (Curated models, pay-as-you-go)"),
     ProviderEntry("opencode-go",    "OpenCode Go",              "OpenCode Go (Open models subscription)"),
     ProviderEntry("bedrock",        "AWS Bedrock",              "AWS Bedrock (Claude, Nova, Llama, DeepSeek; IAM or API key)"),
+    ProviderEntry("crof",           "CrofAI",                   "CrofAI (multi-model proxy — DeepSeek, GLM, Kimi, Qwen, MiniMax)"),
     ProviderEntry("azure-foundry",  "Azure Foundry",            "Azure Foundry (OpenAI-style or Anthropic-style endpoint, your Azure AI deployment)"),
     ProviderEntry("qwen-oauth",     "Qwen OAuth (Portal)",      "Qwen OAuth (Reuses local Qwen CLI login)"),
 ]
@@ -1296,6 +1304,10 @@ _PROVIDER_ALIASES = {
     "lmstudio": "lmstudio",
     "lm-studio": "lmstudio",
     "lm_studio": "lmstudio",
+    # crof
+    "crof-ai": "crof",
+    "crofai": "crof",
+
     "ollama": "custom",  # bare "ollama" = local; use "ollama-cloud" for cloud
     "ollama_cloud": "ollama-cloud",
 }

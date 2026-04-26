@@ -1447,6 +1447,7 @@ class GatewaySlashCommandsMixin:
         current_api_key = ""
         user_provs = None
         custom_provs = None
+        model_whitelist = []
         config_path = _hermes_home / "config.yaml"
         try:
             cfg = _load_gateway_config()
@@ -1456,6 +1457,7 @@ class GatewaySlashCommandsMixin:
                     current_model = model_cfg.get("default", "")
                     current_provider = model_cfg.get("provider", current_provider)
                     current_base_url = model_cfg.get("base_url", "")
+                    model_whitelist = model_cfg.get("whitelist", [])
                 user_provs = cfg.get("providers")
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
@@ -1506,6 +1508,10 @@ class GatewaySlashCommandsMixin:
                     )
                 except Exception:
                     providers = []
+
+                if model_whitelist and providers:
+                    from hermes_cli.model_switch import filter_providers_by_whitelist
+                    providers = filter_providers_by_whitelist(providers, model_whitelist)
 
                 if providers:
                     # Build a callback closure for when the user picks a model.
@@ -1745,6 +1751,10 @@ class GatewaySlashCommandsMixin:
                     custom_providers=custom_provs,
                     max_models=5,
                 )
+                if model_whitelist and providers:
+                    from hermes_cli.model_switch import filter_providers_by_whitelist
+                    providers = filter_providers_by_whitelist(providers, model_whitelist)
+
                 for p in providers:
                     tag = t("gateway.model.current_tag") if p["is_current"] else ""
                     lines.append(f"**{p['name']}** `--provider {p['slug']}`{tag}:")
@@ -2027,6 +2037,167 @@ class GatewaySlashCommandsMixin:
             )
 
         return await _finish_switch()
+
+    async def _handle_fallback_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle /fallback — set the global fallback model used when the primary fails."""
+        from gateway.run import _hermes_home, _load_gateway_config
+        import yaml
+        from hermes_cli.model_switch import (
+            switch_model as _switch_model,
+            parse_model_flags,
+            list_authenticated_providers,
+        )
+        from hermes_cli.providers import get_label
+
+        raw_args = event.get_command_args().strip()
+        model_input, explicit_provider, _persist_global, force_refresh = parse_model_flags(raw_args)
+        if force_refresh:
+            try:
+                from hermes_cli.models import clear_provider_models_cache
+                clear_provider_models_cache()
+            except Exception:
+                pass
+
+        config_path = _hermes_home / "config.yaml"
+        current_fallback_model = ""
+        current_fallback_provider = ""
+        current_base_url = ""
+        user_provs = None
+        custom_provs = None
+        model_whitelist = []
+        try:
+            cfg = _load_gateway_config()
+            fb = cfg.get("fallback_providers") or cfg.get("fallback_model") or None
+            if isinstance(fb, list) and fb:
+                first = fb[0] if isinstance(fb[0], dict) else {}
+                current_fallback_model = first.get("model", "")
+                current_fallback_provider = first.get("provider", "")
+            elif isinstance(fb, dict):
+                current_fallback_model = fb.get("model", "")
+                current_fallback_provider = fb.get("provider", "")
+            model_cfg = cfg.get("model", {})
+            if isinstance(model_cfg, dict):
+                current_base_url = model_cfg.get("base_url", "")
+                model_whitelist = model_cfg.get("whitelist", [])
+            user_provs = cfg.get("providers")
+            try:
+                from hermes_cli.config import get_compatible_custom_providers
+                custom_provs = get_compatible_custom_providers(cfg)
+            except Exception:
+                custom_provs = cfg.get("custom_providers")
+        except Exception:
+            pass
+
+        def _filtered(providers: list[dict]) -> list[dict]:
+            if model_whitelist and providers:
+                from hermes_cli.model_switch import filter_providers_by_whitelist
+                return filter_providers_by_whitelist(providers, model_whitelist)
+            return providers
+
+        async def _set_fallback(model_id: str, provider_slug: str) -> str:
+            fb_list = [{"provider": provider_slug, "model": model_id}]
+            try:
+                if config_path.exists():
+                    with open(config_path, encoding="utf-8") as f:
+                        cfg = yaml.safe_load(f) or {}
+                else:
+                    cfg = {}
+                cfg["fallback_providers"] = fb_list
+                atomic_yaml_write(config_path, cfg)
+            except Exception as exc:
+                return f"❌ Error writing config: {exc}"
+
+            self._fallback_model = fb_list
+            cache_lock = getattr(self, "_agent_cache_lock", None)
+            cache = getattr(self, "_agent_cache", None)
+            if cache_lock and cache is not None:
+                with cache_lock:
+                    for entry in cache.values():
+                        agent = entry[0] if entry else None
+                        if agent and hasattr(agent, "fallback_model"):
+                            try:
+                                agent.fallback_model = fb_list
+                            except Exception:
+                                pass
+
+            plabel = get_label(provider_slug) if get_label else provider_slug
+            return (
+                "🔄 *Fallback Model Set*\n\n"
+                f"Model: `{model_id}`\n"
+                f"Provider: {plabel}\n\n"
+                "_This model will be used when the primary fails._"
+            )
+
+        if not model_input and not explicit_provider:
+            adapter = self.adapters.get(event.source.platform)
+            has_picker = adapter is not None and getattr(type(adapter), "send_model_picker", None) is not None
+            if has_picker:
+                try:
+                    providers = _filtered(list_authenticated_providers(
+                        current_provider=current_fallback_provider or "openrouter",
+                        current_base_url=current_base_url,
+                        user_providers=user_provs,
+                        custom_providers=custom_provs,
+                        max_models=50,
+                        current_model=current_fallback_model,
+                    ))
+                except Exception:
+                    providers = []
+                if providers:
+                    async def _on_fallback_selected(_chat_id: str, model_id: str, provider_slug: str) -> str:
+                        return await _set_fallback(model_id, provider_slug)
+
+                    metadata = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
+                    result = await adapter.send_model_picker(
+                        chat_id=event.source.chat_id,
+                        providers=providers,
+                        current_model=current_fallback_model,
+                        current_provider=current_fallback_provider,
+                        session_key="__fallback__",
+                        on_model_selected=_on_fallback_selected,
+                        metadata=metadata,
+                    )
+                    if result.success:
+                        return None
+
+            fb_label = "Not set"
+            if current_fallback_model:
+                plabel = get_label(current_fallback_provider) if current_fallback_provider else current_fallback_provider
+                fb_label = f"`{current_fallback_model}` on {plabel}"
+            lines = [f"Current fallback: {fb_label}", ""]
+            try:
+                providers = _filtered(list_authenticated_providers(
+                    current_provider=current_fallback_provider or "openrouter",
+                    current_base_url=current_base_url,
+                    user_providers=user_provs,
+                    custom_providers=custom_provs,
+                    max_models=5,
+                    current_model=current_fallback_model,
+                ))
+                for p in providers:
+                    for m in p.get("models", [])[:3]:
+                        tag = " ◀" if m == current_fallback_model else ""
+                        lines.append(f"  `{m}` ({p['name']}){tag}")
+            except Exception:
+                lines.append("_(No providers available)_")
+            lines.append("")
+            lines.append("Use `/fallback <model> --provider <name>` to set.")
+            return "\n".join(lines)
+
+        result = _switch_model(
+            raw_input=model_input,
+            current_provider=current_fallback_provider or "openrouter",
+            current_model=current_fallback_model,
+            current_base_url=current_base_url,
+            current_api_key="",
+            is_global=False,
+            explicit_provider=explicit_provider,
+            user_providers=user_provs,
+            custom_providers=custom_provs,
+        )
+        if not result.success:
+            return f"❌ Error: {result.error_message}"
+        return await _set_fallback(result.new_model, result.target_provider)
 
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.

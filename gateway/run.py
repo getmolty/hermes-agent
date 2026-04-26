@@ -9917,6 +9917,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "codex-runtime":
             return await self._handle_codex_runtime_command(event)
 
+        if canonical == "fallback":
+            return await self._handle_fallback_command(event)
+
         if canonical == "personality":
             return await self._handle_personality_command(event)
 

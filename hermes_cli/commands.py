@@ -136,6 +136,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("codex-runtime", "Toggle codex app-server runtime for OpenAI/Codex models",
                "Configuration", aliases=("codex_runtime",),
                args_hint="[auto|codex_app_server]"),
+    CommandDef("fallback", "Set fallback model (used when primary fails)", "Configuration",
+               args_hint="[model] [--provider name]"),
 
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
