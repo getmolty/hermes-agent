@@ -780,7 +780,245 @@ def setup_model_provider(config: dict, *, quick: bool = False):
     # Tool Gateway prompt is already shown by _model_flow_nous() above.
     save_config(config)
 
+    # ── Fallback Model ──
+    if prompt_yes_no("Configure a fallback model (used when primary fails)?", False):
+        setup_fallback_model(config)
 
+
+# =============================================================================
+# Section 1c: Model Whitelist Configuration
+# =============================================================================
+
+
+def setup_model_whitelist(config: dict) -> None:
+    """Configure which providers and models appear in the model picker.
+
+    Writes a ``model.whitelist`` list to ``config.yaml``.  When set, the
+    Telegram/Discord ``/model`` picker only shows whitelisted entries and
+    hides everything else.
+    """
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    print_header("Model Whitelist (Picker Filter)")
+    print_info("Limit which providers and models appear in the /model picker.")
+    print_info("Providers without API keys are hidden automatically.")
+    print()
+
+    # Build a list of providers that have API keys configured.
+    available: list[tuple[str, str, str]] = []  # (slug, display_name, api_key_env)
+    for slug, pcfg in PROVIDER_REGISTRY.items():
+        if not pcfg.api_key_env_vars:
+            continue
+        for env_var in pcfg.api_key_env_vars:
+            if get_env_value(env_var):
+                display = getattr(pcfg, "name", slug)
+                available.append((slug, display, env_var))
+                break
+
+    # Also check providers that may not be in PROVIDER_REGISTRY
+    # but have known env vars set.  This catches aggregators like
+    # OpenRouter, CrofAI, and direct API providers.
+    _ENV_TO_PROVIDER: dict[str, tuple[str, str]] = {
+        "OPENROUTER_API_KEY": ("openrouter", "OpenRouter"),
+        "CROF_API_KEY": ("crof", "CrofAI"),
+        "DEEPSEEK_API_KEY": ("deepseek", "DeepSeek"),
+        "DEEPSEEK_BASE_URL": ("deepseek", "DeepSeek"),
+        "GLM_API_KEY": ("zai", "Z.AI (GLM)"),
+        "ZAI_API_KEY": ("zai", "Z.AI (GLM)"),
+        "KIMI_API_KEY": ("kimi-coding", "Kimi / Moonshot"),
+        "MINIMAX_API_KEY": ("minimax", "MiniMax"),
+        "XAI_API_KEY": ("xai", "xAI"),
+        "NVIDIA_API_KEY": ("nvidia", "NVIDIA"),
+        "VENICE_API_KEY": ("venice", "Venice"),
+        "GOOGLE_API_KEY": ("gemini", "Google Gemini"),
+        "GEMINI_API_KEY": ("gemini", "Google Gemini"),
+        "ANTHROPIC_API_KEY": ("anthropic", "Anthropic"),
+        "ANTHROPIC_TOKEN": ("anthropic", "Anthropic"),
+    }
+    for env_var, (slug, display) in _ENV_TO_PROVIDER.items():
+        if slug in {p[0] for p in available}:
+            continue
+        if get_env_value(env_var):
+            available.append((slug, display, env_var))
+
+    if not available:
+        print_info("No providers with API keys detected.")
+        print_info("Configure API keys first, then run 'hermes setup whitelist'.")
+        print()
+        return
+
+    # Let the user pick which providers to include.
+    provider_labels = [f"{name} ({slug})" for slug, name, _ in available]
+    print_info("Select providers to show in the model picker:")
+    selected_indices = prompt_checklist(
+        "Which providers should appear in the picker?",
+        provider_labels,
+        pre_selected=list(range(len(available))),
+    )
+
+    selected_providers = [available[i][0] for i in selected_indices]
+    if not selected_providers:
+        # User deselected everything — clear the whitelist.
+        _m = config.get("model")
+        if isinstance(_m, dict):
+            _m.pop("whitelist", None)
+        print_info("Whitelist cleared — all providers will show in the picker.")
+        print()
+        return
+
+    # For each selected provider, let the user pick models.
+    whitelist: list[dict[str, str]] = []
+    for slug in selected_providers:
+        # Get available models for this provider.
+        models = _DEFAULT_PROVIDER_MODELS.get(slug, [])
+        if not models:
+            # Try the models.py catalog.
+            try:
+                from hermes_cli.models import _PROVIDER_MODELS
+                models = _PROVIDER_MODELS.get(slug, [])
+            except Exception:
+                pass
+
+        if not models:
+            # No known models — add a wildcard entry (provider only).
+            whitelist.append({"provider": slug, "model": "*"})
+            continue
+
+        display_name = next(
+            (n for s, n, _ in available if s == slug),
+            slug,
+        )
+        print()
+        print_info(f"Models for {display_name} ({slug}):")
+        model_labels = models[:20]  # Cap at 20 to avoid huge lists
+        if len(models) > 20:
+            model_labels.append("…and more (select all that apply)")
+
+        model_indices = prompt_checklist(
+            f"Select models for {display_name}",
+            model_labels,
+            pre_selected=list(range(min(len(models), 20))),
+        )
+
+        selected_models = [models[i] for i in model_indices if i < len(models)]
+        for m in selected_models:
+            whitelist.append({"provider": slug, "model": m})
+
+    # Save to config
+    _m = config.setdefault("model", {})
+    if isinstance(_m, dict):
+        _m["whitelist"] = whitelist
+    print()
+    print_success(
+        f"Whitelist saved — {len(whitelist)} model(s) across "
+        f"{len(selected_providers)} provider(s)."
+    )
+    print_info("Run 'hermes setup whitelist' again to change.")
+    print()
+
+
+# =============================================================================
+# Section 1d: Fallback Model Configuration
+# =============================================================================
+
+
+def setup_fallback_model(config: dict) -> None:
+    """Configure the fallback model used when the primary provider fails.
+
+    Writes to ``fallback_providers`` in ``config.yaml``.  When the primary
+    model/provider is unreachable (rate-limited, overloaded, or down),
+    Hermes automatically switches to the fallback.
+    """
+    from hermes_cli.auth import PROVIDER_REGISTRY
+
+    print_header("Fallback Model")
+    print_info("Configure a backup model for when your primary provider fails.")
+    print_info("(rate limits, overload, or service errors)")
+    print()
+
+    if not prompt_yes_no("Configure a fallback model?", True):
+        # Clear fallback if user says no
+        config.pop("fallback_providers", None)
+        config.pop("fallback_model", None)
+        print_info("Fallback cleared — no automatic failover.")
+        print()
+        return
+
+    # Build provider list
+    provider_options: list[tuple[str, str]] = [("", "None (skip)")]
+    for slug, pcfg in PROVIDER_REGISTRY.items():
+        if not pcfg.api_key_env_vars:
+            continue
+        for env_var in pcfg.api_key_env_vars:
+            if get_env_value(env_var):
+                display = getattr(pcfg, "name", slug)
+                provider_options.append((slug, display))
+                break
+
+    # Add known aggregators that may not be in PROVIDER_REGISTRY
+    extra_fb = {
+        "openrouter": "OpenRouter",
+        "crof": "CrofAI",
+        "deepseek": "DeepSeek",
+        "zai": "Z.AI (GLM)",
+    }
+    for slug, display in extra_fb.items():
+        if slug not in {p[0] for p in provider_options}:
+            provider_options.append((slug, display))
+
+    fb_choices = [name for _, name in provider_options]
+    fb_idx = prompt_choice(
+        "Select fallback provider:",
+        fb_choices,
+        default=0,
+    )
+
+    if fb_idx == 0:
+        config.pop("fallback_providers", None)
+        config.pop("fallback_model", None)
+        print_info("Fallback cleared.")
+        print()
+        return
+
+    fb_slug = provider_options[fb_idx][0]
+
+    # Prompt for model
+    fb_models = _DEFAULT_PROVIDER_MODELS.get(fb_slug, [])
+    if not fb_models:
+        try:
+            from hermes_cli.models import _PROVIDER_MODELS
+            fb_models = _PROVIDER_MODELS.get(fb_slug, [])
+        except Exception:
+            pass
+
+    fb_model = ""
+    if fb_models:
+        model_choices = fb_models[:15] + ["Enter a custom model name"]
+        model_idx = prompt_choice(
+            f"Select fallback model for {fb_slug}:",
+            model_choices,
+            default=0,
+        )
+        if model_idx < len(fb_models):
+            fb_model = fb_models[model_idx]
+        else:
+            fb_model = prompt("Enter fallback model name").strip()
+    else:
+        fb_model = prompt("Enter fallback model name").strip()
+
+    if not fb_model:
+        print_warning("No model entered — fallback not configured.")
+        print()
+        return
+
+    # Write fallback config
+    config["fallback_providers"] = [
+        {"provider": fb_slug, "model": fb_model},
+    ]
+    print()
+    print_success(f"Fallback configured: {fb_model} via {fb_slug}")
+    print_info("Run 'hermes setup fallback' again to change.")
+    print()
 # =============================================================================
 # Section 1b: TTS Provider Configuration
 # =============================================================================
@@ -2602,6 +2840,8 @@ def _offer_openclaw_migration(hermes_home: Path) -> bool:
 
 SETUP_SECTIONS = [
     ("model", "Model & Provider", setup_model_provider),
+    ("whitelist", "Model Whitelist", setup_model_whitelist),
+    ("fallback", "Fallback Model", setup_fallback_model),
     ("tts", "Text-to-Speech", setup_tts),
     ("terminal", "Terminal Backend", setup_terminal_backend),
     ("gateway", "Messaging Platforms (Gateway)", setup_gateway),
