@@ -2541,7 +2541,12 @@ def filter_providers_by_whitelist(
             continue
 
         models = provider.get("models", [])
-        kept = [m for m in models if m in allowed[slug]]
+
+        # Wildcard: if "*" is in the allowed set, keep all models for this provider.
+        if "*" in allowed[slug]:
+            kept = list(models)
+        else:
+            kept = [m for m in models if m in allowed[slug]]
         if not kept:
             continue
 
