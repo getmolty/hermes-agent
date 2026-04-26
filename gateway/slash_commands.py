@@ -1464,10 +1464,9 @@ class GatewaySlashCommandsMixin:
                     custom_provs = get_compatible_custom_providers(cfg)
                 except Exception:
                     custom_provs = cfg.get("custom_providers")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("Failed to read config for /model: %s", exc)
 
-        # Check for session override
         source = event.source
         # Normalize the source the same way a normal message turn does
         # (Telegram DM topic recovery) before deriving the override key, so
@@ -2085,9 +2084,8 @@ class GatewaySlashCommandsMixin:
                 custom_provs = get_compatible_custom_providers(cfg)
             except Exception:
                 custom_provs = cfg.get("custom_providers")
-        except Exception:
-            pass
-
+        except Exception as exc:
+            logger.debug("Failed to read config for /fallback: %s", exc)
         def _filtered(providers: list[dict]) -> list[dict]:
             if model_whitelist and providers:
                 from hermes_cli.model_switch import filter_providers_by_whitelist
@@ -2103,6 +2101,7 @@ class GatewaySlashCommandsMixin:
                 else:
                     cfg = {}
                 cfg["fallback_providers"] = fb_list
+                cfg.pop("fallback_model", None)
                 atomic_yaml_write(config_path, cfg)
             except Exception as exc:
                 return f"❌ Error writing config: {exc}"
