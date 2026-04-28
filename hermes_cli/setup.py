@@ -797,53 +797,80 @@ def setup_model_whitelist(config: dict) -> None:
     Telegram/Discord ``/model`` picker only shows whitelisted entries and
     hides everything else.
     """
-    from hermes_cli.auth import PROVIDER_REGISTRY
-
     print_header("Model Whitelist (Picker Filter)")
     print_info("Limit which providers and models appear in the /model picker.")
-    print_info("Providers without API keys are hidden automatically.")
+    print_info("Providers without credentials are hidden automatically.")
     print()
 
-    # Build a list of providers that have API keys configured.
-    available: list[tuple[str, str, str]] = []  # (slug, display_name, api_key_env)
-    for slug, pcfg in PROVIDER_REGISTRY.items():
-        if not pcfg.api_key_env_vars:
-            continue
-        for env_var in pcfg.api_key_env_vars:
-            if get_env_value(env_var):
-                display = getattr(pcfg, "name", slug)
-                available.append((slug, display, env_var))
-                break
+    # Build a list of providers that have credentials configured.  Use the
+    # same source of truth as the runtime /model picker so OAuth providers
+    # (OpenAI Codex, Nous, Qwen OAuth, etc.), credential-pool entries, and
+    # user-defined endpoints are visible here too.  The previous
+    # implementation only checked API-key env vars, which hid oauth_external
+    # providers from `hermes setup whitelist` even when auth.json was valid.
+    try:
+        from hermes_cli.model_switch import list_authenticated_providers
+        from hermes_cli.config import get_compatible_custom_providers
 
-    # Also check providers that may not be in PROVIDER_REGISTRY
-    # but have known env vars set.  This catches aggregators like
-    # OpenRouter, CrofAI, and direct API providers.
-    _ENV_TO_PROVIDER: dict[str, tuple[str, str]] = {
-        "OPENROUTER_API_KEY": ("openrouter", "OpenRouter"),
-        "CROF_API_KEY": ("crof", "CrofAI"),
-        "DEEPSEEK_API_KEY": ("deepseek", "DeepSeek"),
-        "DEEPSEEK_BASE_URL": ("deepseek", "DeepSeek"),
-        "GLM_API_KEY": ("zai", "Z.AI (GLM)"),
-        "ZAI_API_KEY": ("zai", "Z.AI (GLM)"),
-        "KIMI_API_KEY": ("kimi-coding", "Kimi / Moonshot"),
-        "MINIMAX_API_KEY": ("minimax", "MiniMax"),
-        "XAI_API_KEY": ("xai", "xAI"),
-        "NVIDIA_API_KEY": ("nvidia", "NVIDIA"),
-        "VENICE_API_KEY": ("venice", "Venice"),
-        "GOOGLE_API_KEY": ("gemini", "Google Gemini"),
-        "GEMINI_API_KEY": ("gemini", "Google Gemini"),
-        "ANTHROPIC_API_KEY": ("anthropic", "Anthropic"),
-        "ANTHROPIC_TOKEN": ("anthropic", "Anthropic"),
-    }
-    for env_var, (slug, display) in _ENV_TO_PROVIDER.items():
-        if slug in {p[0] for p in available}:
+        model_cfg = config.get("model", {}) if isinstance(config.get("model"), dict) else {}
+        picker_providers = list_authenticated_providers(
+            current_provider=model_cfg.get("provider", ""),
+            current_base_url=model_cfg.get("base_url", ""),
+            user_providers=config.get("providers"),
+            custom_providers=get_compatible_custom_providers(config),
+            # Whitelist setup is a configuration surface, not the compact
+            # gateway keyboard. Ask for a broad model list so we do not
+            # accidentally hide models that the user may want to whitelist.
+            max_models=200,
+        )
+    except Exception as exc:
+        logger.debug("Could not list authenticated providers for whitelist setup: %s", exc)
+        picker_providers = []
+
+    def _clean_label(value: object) -> str:
+        """Strip terminal control characters from prompt labels."""
+        return "".join(ch for ch in str(value or "") if ch.isprintable()).strip()
+
+    available: list[tuple[str, str, str]] = []  # (slug, display_name, source)
+    picker_provider_models: dict[str, list[str]] = {}
+    seen_available: set[str] = set()
+    for provider in picker_providers:
+        slug = _clean_label(provider.get("slug"))
+        if not slug or slug in seen_available:
             continue
-        if get_env_value(env_var):
-            available.append((slug, display, env_var))
+        display = _clean_label(provider.get("name")) or slug
+        source = _clean_label(provider.get("source")) or "authenticated"
+        models = provider.get("models") or []
+        if isinstance(models, list):
+            picker_provider_models[slug] = [
+                _clean_label(m) for m in models if _clean_label(m)
+            ]
+        available.append((slug, display, source))
+        seen_available.add(slug)
+
+    # Defensive fallback: keep the old API-key/env detection path if the
+    # unified picker detector fails or returns nothing. OAuth providers still
+    # come from list_authenticated_providers(), but API-key users should not
+    # lose whitelist setup because models.dev/auth-store probing had a bad day.
+    if not available:
+        try:
+            from hermes_cli.auth import PROVIDER_REGISTRY
+
+            for slug, pcfg in PROVIDER_REGISTRY.items():
+                if not pcfg.api_key_env_vars:
+                    continue
+                for env_var in pcfg.api_key_env_vars:
+                    if get_env_value(env_var):
+                        display = _clean_label(getattr(pcfg, "name", slug)) or slug
+                        available.append((slug, display, env_var))
+                        seen_available.add(slug)
+                        break
+        except Exception as exc:
+            logger.debug("Fallback env-provider scan failed for whitelist setup: %s", exc)
 
     if not available:
-        print_info("No providers with API keys detected.")
-        print_info("Configure API keys first, then run 'hermes setup whitelist'.")
+        print_info("No providers with credentials detected.")
+        print_info("Configure API keys or OAuth first, then run 'hermes setup whitelist'.")
         print()
         return
 
@@ -869,8 +896,10 @@ def setup_model_whitelist(config: dict) -> None:
     # For each selected provider, let the user pick models.
     whitelist: list[dict[str, str]] = []
     for slug in selected_providers:
-        # Get available models for this provider.
-        models = _DEFAULT_PROVIDER_MODELS.get(slug, [])
+        # Get available models for this provider. Prefer the same model list
+        # returned by list_authenticated_providers() so setup mirrors /model
+        # exactly, then fall back to static catalogs.
+        models = picker_provider_models.get(slug, []) or _DEFAULT_PROVIDER_MODELS.get(slug, [])
         if not models:
             # Try the models.py catalog.
             try:
@@ -904,10 +933,17 @@ def setup_model_whitelist(config: dict) -> None:
         for m in selected_models:
             whitelist.append({"provider": slug, "model": m})
 
-    # Save to config
-    _m = config.setdefault("model", {})
-    if isinstance(_m, dict):
-        _m["whitelist"] = whitelist
+    # Save to config. Preserve legacy scalar `model: foo` by converting it to
+    # the modern dict form instead of silently dropping the whitelist.
+    existing_model = config.get("model")
+    if isinstance(existing_model, dict):
+        _m = existing_model
+    else:
+        _m = {}
+        if isinstance(existing_model, str) and existing_model.strip():
+            _m["default"] = existing_model.strip()
+        config["model"] = _m
+    _m["whitelist"] = whitelist
     print()
     print_success(
         f"Whitelist saved — {len(whitelist)} model(s) across "

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from hermes_cli.config import load_config, save_config, save_env_value
 from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatures
-from hermes_cli.setup import _print_setup_summary, setup_model_provider
+from hermes_cli.setup import _print_setup_summary, setup_model_provider, setup_model_whitelist
 
 
 def _maybe_keep_current_tts(question, choices):
@@ -273,6 +273,48 @@ def test_setup_switch_preserves_non_model_config(tmp_path, monkeypatch):
     reloaded = load_config()
     assert reloaded["terminal"]["timeout"] == 999
     assert reloaded["model"]["provider"] == "openrouter"
+
+
+def test_setup_whitelist_includes_oauth_providers_from_authenticated_picker(
+    tmp_path, monkeypatch
+):
+    """OAuth providers such as OpenAI Codex must appear in whitelist setup.
+
+    Regression for a setup whitelist bug where only API-key env vars were
+    inspected, so auth.json/credential-pool providers were invisible even
+    though the runtime /model picker could authenticate them.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    _clear_provider_env(monkeypatch)
+
+    import hermes_cli.model_switch as _model_switch
+
+    def fake_authenticated_providers(**_kwargs):
+        return [
+            {
+                "slug": "openai-codex",
+                "name": "OpenAI Codex",
+                "source": "hermes",
+                "models": ["gpt-5.5", "gpt-5.4"],
+                "total_models": 2,
+            }
+        ]
+
+    checklist_answers = iter([
+        [0],      # select OpenAI Codex provider
+        [0, 1],   # select both Codex models
+    ])
+
+    monkeypatch.setattr(_model_switch, "list_authenticated_providers", fake_authenticated_providers)
+    monkeypatch.setattr("hermes_cli.setup.prompt_checklist", lambda *a, **kw: next(checklist_answers))
+
+    config = load_config()
+    setup_model_whitelist(config)
+
+    assert config["model"]["whitelist"] == [
+        {"provider": "openai-codex", "model": "gpt-5.5"},
+        {"provider": "openai-codex", "model": "gpt-5.4"},
+    ]
 
 
 def test_setup_summary_marks_anthropic_auth_as_vision_available(tmp_path, monkeypatch, capsys):
