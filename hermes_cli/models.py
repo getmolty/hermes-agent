@@ -269,6 +269,17 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "gpt-4o-mini",
     ],
     "openai-codex": _codex_curated_models(),
+    "openrouter": [
+        "openrouter/owl-alpha",
+        "moonshotai/kimi-k2.6",
+        "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v4-flash",
+        "anthropic/claude-opus-4.7",
+        "anthropic/claude-sonnet-4.6",
+        "openai/gpt-5.4",
+        "z-ai/glm-5.1",
+        "google/gemini-3.1-pro-preview",
+    ],
     "xai-oauth": _xai_curated_models(),
     "copilot-acp": [
         "copilot-acp",
