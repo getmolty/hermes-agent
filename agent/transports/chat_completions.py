@@ -387,6 +387,16 @@ class ChatCompletionsTransport(ProviderTransport):
         elif anthropic_max_out is not None:
             api_kwargs["max_tokens"] = anthropic_max_out
 
+        # Mercury spends part of tiny completion budgets on hidden reasoning.
+        # Low smoke-test caps like 8/64 tokens can produce content=None with
+        # finish_reason="length" even for "reply OK" prompts, so floor only
+        # explicit tiny caps to a minimal useful budget.
+        if model_lower.startswith("mercury") or model_lower.endswith("/mercury-2") or model_lower.endswith(":mercury-2"):
+            for token_key in ("max_tokens", "max_completion_tokens"):
+                token_value = api_kwargs.get(token_key)
+                if isinstance(token_value, int) and token_value < 128:
+                    api_kwargs[token_key] = 128
+
         # Kimi: top-level reasoning_effort (unless thinking disabled)
         if is_kimi:
             _kimi_thinking_off = bool(

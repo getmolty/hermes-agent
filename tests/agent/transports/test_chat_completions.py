@@ -589,6 +589,30 @@ class TestChatCompletionsBuildKwargs:
         )
         assert kw["max_tokens"] == 4096
 
+    def test_mercury_tiny_max_tokens_is_floored(self, transport):
+        msgs = [{"role": "user", "content": "Reply with exactly: OK"}]
+        kw = transport.build_kwargs(
+            model="mercury-2", messages=msgs,
+            max_tokens=8,
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+        )
+        assert kw["max_tokens"] == 128
+
+    def test_non_mercury_tiny_max_tokens_is_unchanged(self, transport):
+        msgs = [{"role": "user", "content": "Reply with exactly: OK"}]
+        kw = transport.build_kwargs(
+            model="gpt-4o", messages=msgs,
+            max_tokens=8,
+            max_tokens_param_fn=lambda n: {"max_tokens": n},
+        )
+        assert kw["max_tokens"] == 8
+
+    def test_mercury_temperature_contract(self):
+        from agent.auxiliary_client import _fixed_temperature_for_model
+
+        assert _fixed_temperature_for_model("mercury-2") == 0.5
+        assert _fixed_temperature_for_model("inception:mercury-2") == 0.5
+
     def test_ephemeral_overrides_max_tokens(self, transport):
         msgs = [{"role": "user", "content": "Hi"}]
         kw = transport.build_kwargs(

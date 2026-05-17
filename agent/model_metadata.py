@@ -54,6 +54,8 @@ _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "arcee",
     "gmi",
     "tencent-tokenhub",
+    "venice",
+    "inception",
     "custom", "local",
     # Common aliases
     "google", "google-gemini", "google-ai-studio",
@@ -65,6 +67,7 @@ _PROVIDER_PREFIXES: frozenset[str] = frozenset({
     "tencent", "tokenhub", "tencent-cloud", "tencentmaas",
     "arcee-ai", "arceeai",
     "gmi-cloud", "gmicloud",
+    "venice-ai", "veniceai", "inception-labs", "inceptionlabs", "mercury",
     "xai", "x-ai", "x.ai", "grok",
     "nvidia", "nim", "nvidia-nim", "nemotron",
     "qwen-portal", "novita-ai", "novitaai",

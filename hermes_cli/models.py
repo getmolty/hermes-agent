@@ -270,7 +270,6 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "openai-codex": _codex_curated_models(),
     "openrouter": [
-        "openrouter/owl-alpha",
         "moonshotai/kimi-k2.6",
         "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v4-flash",
@@ -417,6 +416,15 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "google/gemini-3.1-flash-lite-preview",
         "anthropic/claude-sonnet-4.6",
         "openai/gpt-5.4",
+    ],
+    "venice": [
+        "mistral-small-3.2-24b",
+        "llama-3.3-70b",
+        "qwen3-235b",
+    ],
+    "inception": [
+        "mercury-2",
+        "mercury-coder",
     ],
     "opencode-zen": [
         "kimi-k2.5",
@@ -1100,6 +1108,8 @@ CANONICAL_PROVIDERS: list[ProviderEntry] = [
     ProviderEntry("arcee",          "Arcee AI",                 "Arcee AI (Trinity models, direct API)"),
     ProviderEntry("gmi",            "GMI Cloud",                "GMI Cloud (Multi-model direct API)"),
     ProviderEntry("fireworks",      "Fireworks AI",             "Fireworks AI (OpenAI-compatible direct model API)"),
+    ProviderEntry("venice",         "Venice AI",                "Venice AI (privacy-preserving OpenAI-compatible direct API)"),
+    ProviderEntry("inception",      "Inception Labs",           "Inception Labs (Mercury diffusion LLMs, OpenAI-compatible direct API)"),
     ProviderEntry("kilocode",       "Kilo Code",                "Kilo Code (Kilo Gateway API)"),
     ProviderEntry("opencode-zen",   "OpenCode Zen",             "OpenCode Zen (Curated models, pay-as-you-go)"),
     ProviderEntry("opencode-go",    "OpenCode Go",              "OpenCode Go (Open models subscription)"),

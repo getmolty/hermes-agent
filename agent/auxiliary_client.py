@@ -382,6 +382,12 @@ def _is_codex_spark(model: Optional[str], provider: Optional[str] = None) -> boo
     return bare == "gpt-5.3-codex-spark"
 
 
+def _is_mercury_model(model: Optional[str]) -> bool:
+    """True for Inception/Mercury diffusion LLMs with a temperature floor."""
+    bare = (model or "").strip().lower().rsplit("/", 1)[-1].rsplit(":", 1)[-1]
+    return bare.startswith("mercury")
+
+
 def _fixed_temperature_for_model(
     model: Optional[str],
     base_url: Optional[str] = None,
@@ -400,6 +406,9 @@ def _fixed_temperature_for_model(
         logger.debug("Omitting temperature for Kimi model %r (server-managed)", model)
         return OMIT_TEMPERATURE
     if _is_arcee_trinity_thinking(model):
+        return 0.5
+    if _is_mercury_model(model):
+        logger.debug("Using temperature 0.5 for Mercury model %r (provider minimum)", model)
         return 0.5
     return None
 

@@ -42,6 +42,8 @@ class TestProviderRegistry:
         ("minimax-cn", "MiniMax (China)", "api_key"),
         ("kilocode", "Kilo Code", "api_key"),
         ("gmi", "GMI Cloud", "api_key"),
+        ("venice", "Venice AI", "api_key"),
+        ("inception", "Inception Labs", "api_key"),
     ])
     def test_provider_registered(self, provider_id, name, auth_type):
         assert provider_id in PROVIDER_REGISTRY
@@ -106,6 +108,18 @@ class TestProviderRegistry:
         assert pconfig.api_key_env_vars == ("GMI_API_KEY",)
         assert pconfig.base_url_env_var == "GMI_BASE_URL"
 
+    def test_venice_env_vars(self):
+        pconfig = PROVIDER_REGISTRY["venice"]
+        assert pconfig.api_key_env_vars == ("VENICE_API_KEY",)
+        assert pconfig.base_url_env_var == "VENICE_BASE_URL"
+        assert pconfig.inference_base_url == "https://api.venice.ai/api/v1"
+
+    def test_inception_env_vars(self):
+        pconfig = PROVIDER_REGISTRY["inception"]
+        assert pconfig.api_key_env_vars == ("INCEPTION_API_KEY",)
+        assert pconfig.base_url_env_var == "INCEPTION_BASE_URL"
+        assert pconfig.inference_base_url == "https://api.inceptionlabs.ai/v1"
+
     def test_huggingface_env_vars(self):
         pconfig = PROVIDER_REGISTRY["huggingface"]
         assert pconfig.api_key_env_vars == ("HF_TOKEN",)
@@ -132,6 +146,8 @@ class TestProviderRegistry:
         assert PROVIDER_REGISTRY["minimax-cn"].inference_base_url == "https://api.minimaxi.com/anthropic"
         assert PROVIDER_REGISTRY["kilocode"].inference_base_url == "https://api.kilo.ai/api/gateway"
         assert PROVIDER_REGISTRY["gmi"].inference_base_url == "https://api.gmi-serving.com/v1"
+        assert PROVIDER_REGISTRY["venice"].inference_base_url == "https://api.venice.ai/api/v1"
+        assert PROVIDER_REGISTRY["inception"].inference_base_url == "https://api.inceptionlabs.ai/v1"
         assert PROVIDER_REGISTRY["huggingface"].inference_base_url == "https://router.huggingface.co/v1"
         assert PROVIDER_REGISTRY["deepinfra"].inference_base_url == "https://api.deepinfra.com/v1/openai"
 
@@ -151,7 +167,8 @@ PROVIDER_ENV_VARS = (
     "OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "LM_API_KEY", "LM_BASE_URL",
-    "GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY",
+    "GLM_API_KEY", "ZAI_API_KEY", "Z_AI_API_KEY", "GLM_BASE_URL",
+    "VENICE_API_KEY", "VENICE_BASE_URL", "INCEPTION_API_KEY", "INCEPTION_BASE_URL",
     "KIMI_API_KEY", "KIMI_BASE_URL", "STEPFUN_API_KEY", "STEPFUN_BASE_URL",
     "MINIMAX_API_KEY", "MINIMAX_CN_API_KEY",
     "KILOCODE_API_KEY", "KILOCODE_BASE_URL",

@@ -207,6 +207,18 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="https://api.upstage.ai/v1",
         base_url_env_var="UPSTAGE_BASE_URL",
     ),
+    "venice": HermesOverlay(
+        transport="openai_chat",
+        extra_env_vars=("VENICE_API_KEY",),
+        base_url_override="https://api.venice.ai/api/v1",
+        base_url_env_var="VENICE_BASE_URL",
+    ),
+    "inception": HermesOverlay(
+        transport="openai_chat",
+        extra_env_vars=("INCEPTION_API_KEY",),
+        base_url_override="https://api.inceptionlabs.ai/v1",
+        base_url_env_var="INCEPTION_BASE_URL",
+    ),
     "ollama-cloud": HermesOverlay(
         transport="openai_chat",
         base_url_override="https://ollama.com/v1",
@@ -368,6 +380,15 @@ ALIASES: Dict[str, str] = {
     # upstage
     "solar": "upstage",
 
+    # venice
+    "venice-ai": "venice",
+    "veniceai": "venice",
+
+    # inception
+    "inception-labs": "inception",
+    "inceptionlabs": "inception",
+    "mercury": "inception",
+
     # crof
     "crof-ai": "crof",
     "crofai": "crof",
@@ -404,6 +425,8 @@ _LABEL_OVERRIDES: Dict[str, str] = {
     "ollama-cloud": "Ollama Cloud",
     "xai-oauth": "xAI Grok OAuth (SuperGrok / Premium+)",
     "crof": "CrofAI",
+    "venice": "Venice AI",
+    "inception": "Inception Labs",
 }
 
 
