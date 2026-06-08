@@ -686,9 +686,9 @@ class TestVoiceReceiver:
     def test_check_silence_returns_completed_utterance(self):
         receiver = self._make_receiver()
         receiver.map_ssrc(100, 42)
-        # 48kHz, stereo, 16-bit = 192000 bytes/sec
-        # MIN_SPEECH_DURATION = 0.5s → need 96000 bytes
-        pcm_data = bytearray(b"\x00" * 96000)
+        # 48kHz, stereo, 16-bit = 192000 bytes/sec.
+        # Use audible nonzero PCM so the realtime noise gate's RMS floor passes.
+        pcm_data = bytearray(b"\x00\x40" * 96000)
         receiver._buffers[100] = pcm_data
         # Set last_packet_time far enough in the past to exceed SILENCE_THRESHOLD
         receiver._last_packet_time[100] = time.monotonic() - 3.0
@@ -696,7 +696,7 @@ class TestVoiceReceiver:
         assert len(completed) == 1
         user_id, data = completed[0]
         assert user_id == 42
-        assert len(data) == 96000
+        assert len(data) == 192000
         # Buffer should be cleared after extraction
         assert len(receiver._buffers[100]) == 0
 
@@ -2378,7 +2378,7 @@ class TestVoiceReception:
     def _fill_buffer(receiver, ssrc, duration_s=1.0, age_s=3.0):
         """Add PCM data to buffer. 48kHz stereo 16-bit = 192000 bytes/sec."""
         size = int(192000 * duration_s)
-        receiver._buffers[ssrc] = bytearray(b"\x00" * size)
+        receiver._buffers[ssrc] = bytearray(b"\x00\x40" * (size // 2))
         receiver._last_packet_time[ssrc] = time.monotonic() - age_s
 
     # -- Known SSRC (normal flow) --
@@ -2853,6 +2853,169 @@ class TestVoiceTTSPlayback:
         assert self._call_should_reply(
             runner, "all", MessageType.VOICE, agent_msgs=agent_msgs, already_sent=True,
         ) is False
+
+
+class TestOpenAIRealtimeSubagentBridge:
+    """Realtime voice can call a single safe Hermes subagent handoff tool."""
+
+    @staticmethod
+    def _make_adapter():
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        adapter = object.__new__(DiscordAdapter)
+        adapter._realtime_locks = {}
+        adapter._realtime_sessions = {}
+        adapter._realtime_subagent_tasks = set()
+        adapter._voice_text_channels = {111: 123}
+        adapter._client = MagicMock()
+        return adapter
+
+    def test_realtime_turn_registers_subagent_tool_and_parses_call(self, monkeypatch):
+        import base64
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        adapter = self._make_adapter()
+        sent = []
+
+        class FakeWS:
+            def __init__(self):
+                self.frames = [
+                    {"type": "response.output_audio.delta", "delta": base64.b64encode(b"\x00" * 64).decode("ascii")},
+                    {"type": "response.output_audio_transcript.delta", "delta": "Kicked to a subagent."},
+                    {
+                        "type": "response.output_item.done",
+                        "item": {
+                            "type": "function_call",
+                            "name": "start_subagent_task",
+                            "call_id": "call_1",
+                            "arguments": json.dumps({
+                                "task": "Research Hermes Agent realtime voice tools",
+                                "task_type": "research",
+                            }),
+                        },
+                    },
+                    {"type": "response.done"},
+                ]
+
+            def send(self, payload):
+                sent.append(json.loads(payload))
+
+            def recv(self, timeout=None):
+                return json.dumps(self.frames.pop(0))
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(DiscordAdapter, "_load_openai_realtime_key", staticmethod(lambda: ("OPENAI_API_KEY", "sk-test")))
+        monkeypatch.setattr(DiscordAdapter, "_discord_pcm_to_realtime_pcm", staticmethod(lambda _pcm: b"\x00" * 48))
+        monkeypatch.setattr("websockets.sync.client.connect", lambda *a, **k: FakeWS())
+
+        result = adapter._openai_realtime_audio_turn_sync(b"ignored", guild_id=111, user_id=42)
+        try:
+            assert result["success"] is True
+            assert result["tool_calls"][0]["arguments"]["task_type"] == "research"
+            session = sent[0]["session"]
+            assert session["tools"][0]["name"] == "start_subagent_task"
+            assert session["tool_choice"] == "auto"
+            assert "background worker" in session["instructions"]
+        finally:
+            if result.get("file_path") and os.path.exists(result["file_path"]):
+                os.unlink(result["file_path"])
+
+    def test_realtime_tool_call_recorder_accepts_memory_query(self):
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        tool_calls = []
+        completed = set()
+
+        OpenAIRealtimeSessionManager._append_realtime_tool_call(
+            tool_calls,
+            completed,
+            "mem-1",
+            "query_hermes_memory",
+            {"query": "Can you see the Bourbon app conversation?"},
+        )
+
+        assert tool_calls == [{
+            "call_id": "mem-1",
+            "name": "query_hermes_memory",
+            "arguments": {"query": "Can you see the Bourbon app conversation?"},
+        }]
+        assert completed == {"mem-1"}
+
+    def test_realtime_memory_context_includes_recent_sessions_and_redacts(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        home = tmp_path / "hermes-home"
+        memories = home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "USER.md").write_text("Joe likes terse operator language\napi_key=live-secret", encoding="utf-8")
+        (memories / "MEMORY.md").write_text("Bourbon source may live under Desktop/Bourbon\n", encoding="utf-8")
+        conn = sqlite3.connect(str(home / "state.db"))
+        conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, title TEXT, started_at REAL, archived INTEGER DEFAULT 0)")
+        conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, timestamp REAL)")
+        conn.execute(
+            "INSERT INTO sessions (id, source, title, started_at, archived) VALUES (?, ?, ?, ?, 0)",
+            ("s1", "discord", "Bourbon Website Creator Attribution", time.time()),
+        )
+        conn.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES (?, ?, ?, ?)",
+            ("s1", "user", "[forkknife] did you make the bourbon website for me or was that openclaw?", time.time()),
+        )
+        conn.commit()
+        conn.close()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        adapter = self._make_adapter()
+        digest = adapter._build_realtime_memory_context(111)
+
+        assert "Bourbon Website Creator Attribution" in digest
+        assert "bourbon website" in digest.lower()
+        assert "live-secret" not in digest
+        assert "[REDACTED]" in digest
+        assert "query_hermes_memory" in digest
+
+    @pytest.mark.asyncio
+    async def test_persistent_realtime_session_update_includes_memory_context(self, monkeypatch):
+        from plugins.platforms.discord.adapter import DiscordAdapter, OpenAIRealtimeSessionManager
+
+        adapter = self._make_adapter()
+        adapter._build_realtime_memory_context = MagicMock(return_value="Recent conversations visible via session_search:\n- Bourbon app thread")
+        sent = []
+
+        class FakeAsyncWS:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+
+            async def close(self):
+                pass
+
+        async def fake_connect(*_args, **_kwargs):
+            return FakeAsyncWS()
+
+        monkeypatch.setattr(DiscordAdapter, "_load_openai_realtime_key", staticmethod(lambda: ("OPENAI_API_KEY", "sk-test")))
+        monkeypatch.setattr("websockets.asyncio.client.connect", fake_connect)
+
+        session = OpenAIRealtimeSessionManager(adapter, 111)
+        await session.start()
+        try:
+            instructions = sent[0]["session"]["instructions"]
+            assert "READ-ONLY HERMES MEMORY CONTEXT" in instructions
+            assert "Bourbon app thread" in instructions
+            assert "call query_hermes_memory" in instructions
+        finally:
+            await session.stop()
+
+    @pytest.mark.asyncio
+    async def test_process_realtime_voice_input_uses_persistent_session(self):
+        adapter = self._make_adapter()
+        fake_session = SimpleNamespace(send_user_audio=AsyncMock(return_value={"success": True}))
+        adapter._realtime_sessions[111] = fake_session
+        adapter._send_realtime_debug_message = AsyncMock()
+
+        await adapter._process_realtime_voice_input(111, 42, b"pcm")
+
+        fake_session.send_user_audio.assert_awaited_once_with(42, b"pcm")
+        adapter._send_realtime_debug_message.assert_not_awaited()
 
 
 class TestUDPKeepalive:

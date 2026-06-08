@@ -363,7 +363,8 @@ class VoiceReceiver:
     """
 
     SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance
-    MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
+    MIN_SPEECH_DURATION = float(os.getenv("HERMES_REALTIME_MIN_SPEECH_SECONDS", "0.9"))  # skip short noise bursts
+    MIN_RMS = int(os.getenv("HERMES_REALTIME_MIN_RMS", "180"))  # skip quiet background noise
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
@@ -662,6 +663,22 @@ class VoiceReceiver:
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
 
                 if silence_duration >= self.SILENCE_THRESHOLD and buf_duration >= self.MIN_SPEECH_DURATION:
+                    try:
+                        import audioop
+                        rms = audioop.rms(bytes(buf), 2)
+                    except Exception:
+                        rms = self.MIN_RMS
+                    if rms < self.MIN_RMS:
+                        logger.debug(
+                            "VoiceReceiver skipped quiet buffer ssrc=%s duration=%.2fs rms=%s threshold=%s",
+                            ssrc,
+                            buf_duration,
+                            rms,
+                            self.MIN_RMS,
+                        )
+                        self._buffers[ssrc] = bytearray()
+                        self._last_packet_time.pop(ssrc, None)
+                        continue
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
                         # SSRC not mapped (SPEAKING event missing after bot rejoin).
@@ -790,6 +807,417 @@ def _read_discord_prompt_timeout() -> int:
     if seconds > _DISCORD_PROMPT_TIMEOUT_MAX:
         return _DISCORD_PROMPT_TIMEOUT_MAX
     return seconds
+
+
+class OpenAIRealtimeSessionManager:
+    """Manages a persistent OpenAI Realtime API session for Discord voice.
+
+    Wraps a single realtime WebSocket connection with reconnect, ducking
+    coordination, and subagent/memory tool-call dispatch.
+    """
+
+    def __init__(self, adapter: "DiscordAdapter", guild_id: int):
+        self.adapter = adapter
+        self.guild_id = guild_id
+        self.ws = None
+        self.model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
+        self.voice = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
+        self.key_source: Optional[str] = None
+        self._turn_lock = asyncio.Lock()
+        self._connected = False
+
+    @staticmethod
+    def _required_arg_for_realtime_tool(tool_name: str) -> Optional[str]:
+        return {
+            "start_subagent_task": "task",
+            "query_hermes_memory": "query",
+        }.get(tool_name)
+
+    @staticmethod
+    def _infer_realtime_tool_name(name: Any, args: Dict[str, Any]) -> str:
+        tool_name = str(name or "")
+        if tool_name in {"start_subagent_task", "query_hermes_memory"}:
+            return tool_name
+        if args.get("query"):
+            return "query_hermes_memory"
+        if args.get("task"):
+            return "start_subagent_task"
+        return tool_name
+
+    @classmethod
+    def _append_realtime_tool_call(
+        cls,
+        tool_calls: List[Dict[str, Any]],
+        completed_tool_call_ids: set,
+        call_id: str,
+        name: Any,
+        args: Dict[str, Any],
+    ) -> None:
+        if not call_id or call_id in completed_tool_call_ids:
+            return
+        tool_name = cls._infer_realtime_tool_name(name, args)
+        required_arg = cls._required_arg_for_realtime_tool(tool_name)
+        if required_arg and args.get(required_arg):
+            tool_calls.append({"call_id": call_id, "name": tool_name, "arguments": args})
+            completed_tool_call_ids.add(call_id)
+
+    @staticmethod
+    def default_instructions() -> str:
+        configured = os.getenv("OPENAI_REALTIME_INSTRUCTIONS", "").strip()
+        if configured:
+            return configured
+        return (
+            "You are Hermes, Joe Ross's low-latency Discord voice chief of staff. "
+            "Speak ONLY in English, even if you hear other languages or background speech. "
+            "Do not respond to room noise, music, accidental audio, or side chatter. Only respond when Joe clearly addresses Hermes/Jarvis/you, asks a direct question, or continues an active exchange. "
+            "If the audio is ambiguous, stay silent. "
+            "Keep normal replies short: one or two sentences. Do not end with generic 'how can I help' loops. "
+            "You may answer from the provided conversation context. When Joe asks what you remember, asks about his preferences/history/projects, or asks a memory-dependent question, call query_hermes_memory instead of guessing; briefly say you need a minute if you speak first. "
+            "For web research, browsing, coding, debugging, file edits, building, repo work, or multi-step tasks, "
+            "call start_subagent_task with a precise task instead of pretending you used tools yourself. "
+            "After starting background work, briefly say you are starting it in the background and will report back; do not describe Hermes as a separate external system. "
+            "When a memory or background-task completion is injected into this conversation, act in the same voice: "
+            "say the result is ready and offer a compact summary or full readout. Do not dump a long raw result unless Joe asks."
+        )
+
+    async def _send(self, payload: Dict[str, Any]) -> None:
+        if not self.ws:
+            raise RuntimeError("Realtime WebSocket is not connected")
+        await self.ws.send(json.dumps(payload))
+
+    async def start(self) -> None:
+        if self._connected and self.ws is not None:
+            return
+        key_name, api_key = self.adapter._load_openai_realtime_key()
+        if not api_key:
+            raise RuntimeError("missing OPENAI_REALTIME_API_KEY / VOICE_TOOLS_OPENAI_KEY / OPENAI_API_KEY")
+        try:
+            from websockets.asyncio.client import connect
+        except Exception as exc:
+            raise RuntimeError("websockets package is required for OpenAI Realtime") from exc
+
+        url = f"wss://api.openai.com/v1/realtime?model={self.model}"
+        headers = [("Authorization", f"Bearer {api_key}")]
+        self.ws = await connect(url, additional_headers=headers, open_timeout=15)
+        self.key_source = key_name
+        self._connected = True
+        instructions = self.default_instructions()
+        memory_context = self.adapter._build_realtime_memory_context(self.guild_id)
+        if memory_context:
+            instructions = (
+                f"{instructions}\n\n"
+                "READ-ONLY HERMES MEMORY CONTEXT (bounded, secret-redacted):\n"
+                f"{memory_context}\n\n"
+                "Use this as fast context for spoken answers. If Joe asks about a past conversation, project, "
+                "preference, or anything not covered here, call query_hermes_memory instead of saying you cannot see it."
+            )
+        await self._send({
+            "type": "session.update",
+            "session": {
+                "type": "realtime",
+                "instructions": instructions,
+                "audio": {
+                    "input": {"format": {"type": "audio/pcm", "rate": 24000}},
+                    "output": {"voice": self.voice, "format": {"type": "audio/pcm", "rate": 24000}},
+                },
+                "tools": [
+                    self.adapter._openai_realtime_subagent_tool_schema(),
+                    self.adapter._openai_realtime_memory_tool_schema(),
+                ],
+                "tool_choice": "auto",
+            },
+        })
+        logger.info(
+            "OpenAI Realtime persistent session started guild=%s model=%s voice=%s key_source=%s",
+            self.guild_id,
+            self.model,
+            self.voice,
+            key_name,
+        )
+
+    async def stop(self) -> None:
+        ws = self.ws
+        self.ws = None
+        self._connected = False
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+        logger.info("OpenAI Realtime persistent session stopped guild=%s", self.guild_id)
+
+    async def send_user_audio(self, user_id: int, pcm_data: bytes) -> Dict[str, Any]:
+        async with self._turn_lock:
+            try:
+                await self.start()
+                realtime_pcm = self.adapter._discord_pcm_to_realtime_pcm(pcm_data)
+                if not realtime_pcm:
+                    return {"success": False, "error": "empty realtime PCM after conversion"}
+                import base64
+                await self._send({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_audio",
+                            "audio": base64.b64encode(realtime_pcm).decode("ascii"),
+                        }],
+                    },
+                })
+                return await self._run_response(user_id=user_id)
+            except Exception:
+                # If the persistent socket got stale, reset it so the next
+                # utterance can reconnect cleanly instead of wedging voice.
+                await self.stop()
+                raise
+
+    async def inject_subagent_result(self, task_id: str, result: str, *, failed: bool = False) -> Dict[str, Any]:
+        async with self._turn_lock:
+            try:
+                await self.start()
+                status = "failed or blocked" if failed else "finished"
+                safe = (result or "").strip()[:6000]
+                await self._send({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": (
+                                f"Background task {task_id} {status}. This is an injected system relay, not Joe speaking. "
+                                "Tell Joe in English that the background task finished and offer a compact summary or full readout. "
+                                "If the result is short, summarize it in one sentence. Do not call tools for this injected result.\n\n"
+                                f"RESULT:\n{safe}"
+                            ),
+                        }],
+                    },
+                })
+                return await self._run_response(user_id=0)
+            except Exception:
+                await self.stop()
+                raise
+
+    async def inject_memory_result(self, query_id: str, result: str, *, failed: bool = False) -> Dict[str, Any]:
+        async with self._turn_lock:
+            try:
+                await self.start()
+                status = "failed" if failed else "ready"
+                safe = (result or "").replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere").strip()[:6000]
+                await self._send({
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": (
+                                f"Memory lookup {query_id} is {status}. This is an injected system relay, not Joe speaking. "
+                                "Answer Joe in your normal voice using the memory result below. Keep it concise; offer to dig deeper if needed. "
+                                "Do not call tools for this injected result.\n\n"
+                                f"MEMORY RESULT:\n{safe}"
+                            ),
+                        }],
+                    },
+                })
+                return await self._run_response(user_id=0)
+            except Exception:
+                await self.stop()
+                raise
+
+    def _write_audio_wav(self, audio_out: bytearray, *, user_id: int) -> str:
+        import uuid
+        import wave
+        out_dir = _Path(tempfile.gettempdir()) / "hermes_realtime_voice"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        wav_path = out_dir / f"realtime_reply_{self.guild_id}_{user_id}_{uuid.uuid4().hex[:10]}.wav"
+        with wave.open(str(wav_path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(24000)
+            wav.writeframes(audio_out)
+        return str(wav_path)
+
+    async def _synthesize_realtime_notice(self, text: str, *, user_id: int) -> Optional[str]:
+        """Use the active Realtime voice for canned notices so voice stays consistent."""
+        if not self.ws:
+            return None
+        audio_out = bytearray()
+        timeout = min(12.0, float(os.getenv("OPENAI_REALTIME_NOTICE_TIMEOUT", "12")))
+        start = time.monotonic()
+        try:
+            await self._send({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_text",
+                        "text": (
+                            "Injected system relay, not Joe speaking. Say exactly this in your normal configured voice, "
+                            "do not call any tools, and do not add extra wording: "
+                            f"{text}"
+                        ),
+                    }],
+                },
+            })
+            await self._send({"type": "response.create", "response": {"output_modalities": ["audio"]}})
+            while time.monotonic() - start < timeout:
+                raw = await asyncio.wait_for(self.ws.recv(), timeout=max(0.1, timeout - (time.monotonic() - start)))
+                frame = json.loads(raw) if isinstance(raw, str) else raw
+                if not isinstance(frame, dict):
+                    continue
+                ftype = frame.get("type", "")
+                if ftype == "error":
+                    return None
+                if ftype in {"response.audio.delta", "response.output_audio.delta"}:
+                    b64 = frame.get("delta") or frame.get("audio") or ""
+                    if b64:
+                        try:
+                            import base64
+                            audio_out.extend(base64.b64decode(b64))
+                        except Exception:
+                            pass
+                elif ftype in {"response.done", "response.completed", "response.cancelled", "response.failed"}:
+                    break
+        except Exception:
+            logger.debug("Realtime notice synthesis failed", exc_info=True)
+            return None
+        if not audio_out:
+            return None
+        return self._write_audio_wav(audio_out, user_id=user_id)
+
+    async def _run_response(self, *, user_id: int) -> Dict[str, Any]:
+        if not self.ws:
+            return {"success": False, "error": "Realtime WebSocket is not connected"}
+        audio_out = bytearray()
+        transcript_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        pending_tool_calls: Dict[str, Dict[str, Any]] = {}
+        completed_tool_call_ids: set[str] = set()
+        event_counts: Dict[str, int] = {}
+        timeout = float(os.getenv("OPENAI_REALTIME_TIMEOUT", "45"))
+        start = time.monotonic()
+
+        await self._send({"type": "response.create", "response": {"output_modalities": ["audio"]}})
+        while time.monotonic() - start < timeout:
+            remaining = max(0.1, timeout - (time.monotonic() - start))
+            raw = await asyncio.wait_for(self.ws.recv(), timeout=remaining)
+            frame = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(frame, dict):
+                continue
+            ftype = frame.get("type", "?")
+            event_counts[ftype] = event_counts.get(ftype, 0) + 1
+            if ftype == "error":
+                raise RuntimeError(f"OpenAI Realtime error: {frame.get('error', frame)}")
+            if ftype in {"response.audio.delta", "response.output_audio.delta"}:
+                b64 = frame.get("delta") or frame.get("audio") or ""
+                if b64:
+                    try:
+                        import base64
+                        audio_out.extend(base64.b64decode(b64))
+                    except Exception:
+                        pass
+            elif ftype in {"response.audio_transcript.delta", "response.output_audio_transcript.delta"}:
+                transcript_parts.append(str(frame.get("delta") or ""))
+            elif ftype in {"response.output_item.added", "response.output_item.done"}:
+                raw_item = frame.get("item")
+                item: Dict[str, Any] = raw_item if isinstance(raw_item, dict) else {}
+                if item.get("type") == "function_call" and item.get("name") in {"start_subagent_task", "query_hermes_memory"}:
+                    call_id = str(item.get("call_id") or item.get("id") or "")
+                    pending = pending_tool_calls.setdefault(call_id, {"name": item.get("name"), "arguments": ""})
+                    if item.get("arguments"):
+                        pending["arguments"] = str(item.get("arguments") or "")
+                    if ftype == "response.output_item.done" and call_id not in completed_tool_call_ids:
+                        args = self.adapter._parse_realtime_tool_arguments(pending.get("arguments"))
+                        self._append_realtime_tool_call(
+                            tool_calls,
+                            completed_tool_call_ids,
+                            call_id,
+                            item.get("name") or pending.get("name"),
+                            args,
+                        )
+            elif ftype == "response.function_call_arguments.delta":
+                call_id = str(frame.get("call_id") or frame.get("item_id") or "")
+                pending = pending_tool_calls.setdefault(call_id, {"name": frame.get("name"), "arguments": ""})
+                pending["arguments"] = str(pending.get("arguments") or "") + str(frame.get("delta") or "")
+            elif ftype == "response.function_call_arguments.done":
+                call_id = str(frame.get("call_id") or frame.get("item_id") or "")
+                pending = pending_tool_calls.setdefault(call_id, {"name": frame.get("name"), "arguments": ""})
+                if frame.get("arguments"):
+                    pending["arguments"] = str(frame.get("arguments") or "")
+                if call_id not in completed_tool_call_ids:
+                    args = self.adapter._parse_realtime_tool_arguments(pending.get("arguments"))
+                    self._append_realtime_tool_call(
+                        tool_calls,
+                        completed_tool_call_ids,
+                        call_id,
+                        pending.get("name") or frame.get("name"),
+                        args,
+                    )
+            elif ftype in {"response.done", "response.completed", "response.cancelled", "response.failed"}:
+                break
+        else:
+            return {"success": False, "error": "Realtime response timed out", "events": event_counts}
+
+        transcript = "".join(transcript_parts).strip()
+        fallback_path: Optional[str] = None
+        audio_file: Optional[str]
+        if not audio_out and tool_calls:
+            fallback_text = "Give me just a minute — I’m checking on that now."
+            fallback_path = await self._synthesize_realtime_notice(fallback_text, user_id=user_id)
+            if not fallback_path:
+                fallback_path = self.adapter._realtime_fallback_tts_sync(fallback_text, guild_id=self.guild_id, user_id=user_id)
+            if fallback_path:
+                audio_file = fallback_path
+                transcript = fallback_text
+            else:
+                audio_file = None
+        elif audio_out:
+            audio_file = self._write_audio_wav(audio_out, user_id=user_id)
+        else:
+            return {"success": False, "error": "Realtime returned no audio", "events": event_counts}
+
+        try:
+            if os.getenv("HERMES_DISCORD_REALTIME_DEBUG", "true").lower() in {"1", "true", "yes", "on"} and transcript:
+                await self.adapter._send_realtime_debug_message(
+                    self.guild_id,
+                    f"**[Realtime]** {transcript[:1800]}",
+                )
+            for tool_call in tool_calls:
+                if isinstance(tool_call, dict):
+                    if tool_call.get("name") == "query_hermes_memory":
+                        await self.adapter._launch_realtime_memory_query_from_tool_call(self.guild_id, user_id, tool_call)
+                    else:
+                        await self.adapter._launch_realtime_subagent_from_tool_call(self.guild_id, user_id, tool_call)
+            if audio_file:
+                await self.adapter.play_in_voice_channel(self.guild_id, audio_file)
+        finally:
+            if audio_file:
+                try:
+                    os.unlink(str(audio_file))
+                except OSError:
+                    pass
+
+        logger.info(
+            "OpenAI Realtime persistent voice reply guild=%s user=%s bytes=%s transcript=%s",
+            self.guild_id,
+            user_id,
+            len(audio_out),
+            transcript[:100],
+        )
+        return {
+            "success": True,
+            "file_path": audio_file,
+            "transcript": transcript,
+            "audio_bytes": len(audio_out),
+            "events": event_counts,
+            "model": self.model,
+            "voice": self.voice,
+            "key_source": self.key_source,
+            "tool_calls": tool_calls,
+        }
 
 
 class DiscordAdapter(BasePlatformAdapter):
@@ -2998,6 +3426,741 @@ class DiscordAdapter(BasePlatformAdapter):
         finally:
             if receiver:
                 receiver.resume()
+
+    # ------------------------------------------------------------------
+    # OpenAI Realtime voice engine (utterance-level Discord bridge)
+    # ------------------------------------------------------------------
+
+    def set_voice_engine(self, guild_id: int, engine: str = "hermes") -> None:
+        """Select the voice engine for a connected guild voice session."""
+        normalized = (engine or "hermes").strip().lower().replace("-", "_")
+        if normalized in {"realtime", "openai", "openai_realtime", "rt"}:
+            normalized = "openai_realtime"
+        elif normalized not in {"hermes", "openai_realtime"}:
+            normalized = "hermes"
+        self._voice_engines[guild_id] = normalized
+        if normalized != "openai_realtime":
+            session = getattr(self, "_realtime_sessions", {}).pop(guild_id, None)
+            if session is not None:
+                try:
+                    asyncio.create_task(session.stop())
+                except RuntimeError:
+                    pass
+
+    def get_voice_engine(self, guild_id: int) -> str:
+        return getattr(self, "_voice_engines", {}).get(guild_id, "hermes")
+
+    def has_openai_realtime_key(self) -> bool:
+        return bool(self._load_openai_realtime_key()[1])
+
+    @staticmethod
+    def _redact_realtime_memory_context(value: Any) -> str:
+        import re
+        safe = str(value or "")
+        patterns = [
+            re.compile(r"(?i)\b[A-Za-z0-9_-]*(api[_-]?key|token|secret|password|passwd|authorization)\s*[:=]\s*[^\s,;]+"),
+            re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_.-]{6,}"),
+            re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{6,}"),
+            re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{6,}"),
+            re.compile(r"\b[A-Za-z0-9_-]{24,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{20,}\b"),
+        ]
+        for pattern in patterns:
+            safe = pattern.sub("[REDACTED]", safe)
+        return safe.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+
+    @staticmethod
+    def _bound_realtime_memory_context(text: str, max_chars: int) -> str:
+        if len(text) <= max_chars:
+            return text
+        return text[: max(0, max_chars - 1)].rstrip() + "…"
+
+    @staticmethod
+    def _snippet_realtime_memory_context(text: Any, max_chars: int = 260) -> str:
+        safe = DiscordAdapter._redact_realtime_memory_context(text).replace("\n", " ").strip()
+        if len(safe) <= max_chars:
+            return safe
+        return safe[: max(0, max_chars - 1)].rstrip() + "…"
+
+    def _build_realtime_memory_context(self, guild_id: int) -> str:
+        """Build a fast, bounded read-only memory/session digest for Realtime startup.
+
+        This gives the low-latency voice model immediate cross-conversation
+        orientation without exposing raw memory write tools.  Deeper lookups still
+        go through ``query_hermes_memory`` so the normal Hermes memory/session
+        tools can search on demand in the background.
+        """
+        try:
+            max_chars = int(os.getenv("HERMES_REALTIME_CONTEXT_MAX_CHARS", "6000"))
+        except ValueError:
+            max_chars = 6000
+        max_chars = max(500, min(max_chars, 9000))
+        try:
+            recent_limit = int(os.getenv("HERMES_REALTIME_RECENT_SESSION_LIMIT", "12"))
+        except ValueError:
+            recent_limit = 12
+        recent_limit = max(0, min(recent_limit, 30))
+
+        try:
+            from hermes_constants import get_hermes_home
+            home = get_hermes_home()
+        except Exception:
+            home = _Path(os.getenv("HERMES_HOME") or _Path.home() / ".hermes")
+
+        lines: List[str] = [
+            "Fast context available at session start; if insufficient, use query_hermes_memory.",
+        ]
+        mem_dir = home / "memories"
+        for label, filename, limit in (
+            ("User profile", "USER.md", 900),
+            ("Operator memory", "MEMORY.md", 900),
+        ):
+            path = mem_dir / filename
+            try:
+                if path.exists():
+                    content = path.read_text(errors="ignore")
+                    content = "\n".join(
+                        line.strip() for line in content.splitlines()
+                        if line.strip() and line.strip() != "§"
+                    )
+                    content = self._bound_realtime_memory_context(
+                        self._redact_realtime_memory_context(content),
+                        limit,
+                    )
+                    if content:
+                        lines.append(f"\n{label}:\n{content}")
+            except Exception:
+                continue
+
+        state_db = home / "state.db"
+        if recent_limit and state_db.exists():
+            try:
+                import datetime as _dt
+                import sqlite3
+                conn = sqlite3.connect(str(state_db))
+                try:
+                    rows = conn.execute(
+                        """
+                        SELECT
+                            s.id,
+                            COALESCE(s.title, ''),
+                            COALESCE(s.source, ''),
+                            s.started_at,
+                            COALESCE((
+                                SELECT m.content
+                                FROM messages m
+                                WHERE m.session_id = s.id
+                                  AND m.role = 'user'
+                                  AND m.content IS NOT NULL
+                                  AND m.content != ''
+                                ORDER BY m.timestamp ASC
+                                LIMIT 1
+                            ), '')
+                        FROM sessions s
+                        WHERE COALESCE(s.archived, 0) = 0
+                          AND COALESCE(s.source, '') != 'cron'
+                        ORDER BY s.started_at DESC
+                        LIMIT ?
+                        """,
+                        (recent_limit,),
+                    ).fetchall()
+                finally:
+                    conn.close()
+                if rows:
+                    lines.append("\nRecent conversations visible via session_search:")
+                    for _sid, title, source, started_at, first_user in rows:
+                        try:
+                            when = _dt.datetime.fromtimestamp(float(started_at)).strftime("%Y-%m-%d")
+                        except Exception:
+                            when = "recent"
+                        label = title or self._snippet_realtime_memory_context(first_user, 80) or "untitled"
+                        snippet = self._snippet_realtime_memory_context(first_user, 180)
+                        if snippet and snippet != label:
+                            lines.append(f"- {when} [{source}] {label}: {snippet}")
+                        else:
+                            lines.append(f"- {when} [{source}] {label}")
+            except Exception as exc:
+                logger.debug("Realtime memory context session digest failed guild=%s: %s", guild_id, exc, exc_info=True)
+
+        return self._bound_realtime_memory_context("\n".join(lines).strip(), max_chars)
+
+    @staticmethod
+    def _openai_realtime_subagent_tool_schema() -> Dict[str, Any]:
+        """Realtime function tool for kicking durable work to a background worker."""
+        return {
+            "type": "function",
+            "name": "start_subagent_task",
+            "description": (
+                "Start a background task for work that needs tools: "
+                "web research, browsing, coding, debugging, file edits, building pages, "
+                "repo work, or multi-step tasks. Use this instead of claiming the realtime "
+                "voice model did the work itself."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "The complete task for the background worker to execute.",
+                    },
+                    "task_type": {
+                        "type": "string",
+                        "enum": ["research", "web", "coding", "debugging", "build", "general"],
+                        "description": "Best-fit task category; controls the default toolset.",
+                    },
+                    "deliverable": {
+                        "type": "string",
+                        "description": "What the subagent should post back when done.",
+                    },
+                    "toolsets": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional Hermes toolsets, e.g. web, browser, terminal, file, github.",
+                    },
+                },
+                "required": ["task"],
+                "additionalProperties": False,
+            },
+        }
+
+    @staticmethod
+    def _openai_realtime_memory_tool_schema() -> Dict[str, Any]:
+        """Realtime function tool for asking stored memory without exposing raw memory tools."""
+        return {
+            "type": "function",
+            "name": "query_hermes_memory",
+            "description": (
+                "Ask stored memory/session context a question about Joe, his preferences, past projects, "
+                "or prior conversations. Use this when the answer depends on memory instead of guessing."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The concise memory question to answer.",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Short voice-session context for why Joe is asking.",
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        }
+
+    @staticmethod
+    def _parse_realtime_tool_arguments(raw: Any) -> Dict[str, Any]:
+        if isinstance(raw, dict):
+            return raw
+        if not isinstance(raw, str) or not raw.strip():
+            return {}
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+
+    @staticmethod
+    def _infer_realtime_subagent_toolsets(args: Dict[str, Any]) -> str:
+        """Return a safe comma-separated Hermes toolset list for a subagent."""
+        requested = args.get("toolsets")
+        allowed = {
+            "web", "browser", "terminal", "file", "vision", "skills",
+            "session_search", "github", "image_gen", "code_execution",
+        }
+        if isinstance(requested, list):
+            chosen = [str(x).strip() for x in requested if str(x).strip() in allowed]
+            if chosen:
+                return ",".join(dict.fromkeys(chosen))
+
+        task_type = str(args.get("task_type") or "general").strip().lower()
+        if task_type in {"research", "web"}:
+            chosen = ["web", "browser", "file", "skills", "session_search"]
+        elif task_type in {"coding", "debugging", "build"}:
+            chosen = ["terminal", "file", "web", "browser", "github", "skills", "session_search"]
+        else:
+            chosen = ["web", "browser", "terminal", "file", "vision", "skills", "session_search"]
+        return ",".join(chosen)
+
+    @staticmethod
+    def _build_realtime_subagent_prompt(args: Dict[str, Any], *, guild_id: int, user_id: int) -> str:
+        task = str(args.get("task") or "").strip()
+        deliverable = str(args.get("deliverable") or "").strip()
+        task_type = str(args.get("task_type") or "general").strip().lower()
+        if not deliverable:
+            deliverable = "Post a concise PASS / PARTIAL / BLOCKED report with evidence, paths, URLs, commands, and test results."
+        return (
+            "You are a Hermes subagent launched from Discord OpenAI Realtime voice.\n"
+            f"Origin: guild_id={guild_id}, voice_user_id={user_id}.\n"
+            f"Task type: {task_type}.\n\n"
+            "TASK:\n"
+            f"{task}\n\n"
+            "DELIVERABLE:\n"
+            f"{deliverable}\n\n"
+            "Operator rules:\n"
+            "- Do real tool-backed work; do not merely describe a plan.\n"
+            "- Do not ask clarifying questions; make reasonable assumptions and label them.\n"
+            "- If editing/building/debugging, inspect files first and verify with commands/tests.\n"
+            "- If researching/browsing, cite URLs and distinguish verified facts from assumptions.\n"
+            "- Final answer must be compact and useful for posting back into Discord.\n"
+        )
+
+    def _realtime_fallback_tts_sync(self, text: str, *, guild_id: int, user_id: int) -> Optional[str]:
+        """Generate a short local TTS acknowledgement when Realtime only emitted a tool call."""
+        try:
+            from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
+            import uuid
+            out_dir = _Path(tempfile.gettempdir()) / "hermes_realtime_voice"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out_path = out_dir / f"realtime_tool_ack_{guild_id}_{user_id}_{uuid.uuid4().hex[:10]}.mp3"
+            result_json = text_to_speech_tool(
+                text=_strip_markdown_for_tts(text[:500]),
+                output_path=str(out_path),
+            )
+            result = json.loads(result_json) if isinstance(result_json, str) else {}
+            actual = result.get("file_path") or str(out_path)
+            if result.get("success") and os.path.isfile(actual):
+                return str(actual)
+        except Exception:
+            logger.debug("Realtime fallback TTS failed", exc_info=True)
+        return None
+
+    @staticmethod
+    def _load_openai_realtime_key() -> Tuple[Optional[str], Optional[str]]:
+        """Load a normal OpenAI Platform API key without logging secret material."""
+        vals: Dict[str, str] = {}
+        try:
+            from hermes_constants import get_hermes_home
+            env_path = get_hermes_home() / ".env"
+        except Exception:
+            env_path = _Path(os.getenv("HERMES_HOME") or _Path.home() / ".hermes") / ".env"
+        try:
+            if env_path.exists():
+                for raw in env_path.read_text(errors="ignore").splitlines():
+                    line = raw.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    if line.startswith("export "):
+                        line = line[len("export "):].strip()
+                    key, value = line.split("=", 1)
+                    vals[key.strip()] = value.strip().strip('\"').strip("'")
+        except Exception:
+            pass
+        for name in ("OPENAI_REALTIME_API_KEY", "VOICE_TOOLS_OPENAI_KEY", "OPENAI_API_KEY"):
+            value = os.getenv(name) or vals.get(name)
+            if value:
+                return name, value
+        return None, None
+
+    @staticmethod
+    def _discord_pcm_to_realtime_pcm(pcm_data: bytes) -> bytes:
+        """Convert Discord native 48kHz stereo PCM16 to OpenAI 24kHz mono PCM16."""
+        import audioop  # stdlib; deprecated in 3.13 but available on this runtime
+        mono = audioop.tomono(pcm_data, 2, 0.5, 0.5)
+        converted, _state = audioop.ratecv(mono, 2, 1, VoiceReceiver.SAMPLE_RATE, 24000, None)
+        return converted
+
+    def _openai_realtime_audio_turn_sync(
+        self,
+        pcm_data: bytes,
+        *,
+        guild_id: int,
+        user_id: int,
+    ) -> Dict[str, Any]:
+        """Send one completed Discord utterance to Realtime and write a WAV reply."""
+        import base64
+        import wave
+        import uuid
+
+        key_name, api_key = self._load_openai_realtime_key()
+        if not api_key:
+            raise RuntimeError("missing OPENAI_REALTIME_API_KEY / VOICE_TOOLS_OPENAI_KEY / OPENAI_API_KEY")
+        try:
+            from websockets.sync.client import connect
+        except Exception as exc:
+            raise RuntimeError("websockets package is required for OpenAI Realtime") from exc
+
+        model = os.getenv("OPENAI_REALTIME_MODEL", "gpt-realtime")
+        voice = os.getenv("OPENAI_REALTIME_VOICE", "alloy")
+        instructions = os.getenv("OPENAI_REALTIME_INSTRUCTIONS", "").strip() or (
+            "You are Hermes, Joe Ross's low-latency Discord voice companion. "
+            "Talk naturally, keep replies short, and help the user think through issues. "
+            "For normal conversation, answer directly in a sentence or two. "
+            "When the user asks you to research the web, browse, code, debug, build a page, edit files, "
+            "work on a codebase, or run a multi-step task, call start_subagent_task with a precise task. "
+            "After calling it, say briefly that you are starting it in the background and will post the result. "
+            "Do not claim you personally used tools; a background worker does the tool work."
+        )
+
+        realtime_pcm = self._discord_pcm_to_realtime_pcm(pcm_data)
+        if not realtime_pcm:
+            return {"success": False, "error": "empty realtime PCM after conversion"}
+
+        url = f"wss://api.openai.com/v1/realtime?model={model}"
+        headers = [("Authorization", f"Bearer {api_key}")]
+        try:
+            ws = connect(url, additional_headers=headers, open_timeout=15)
+        except TypeError:
+            ws = connect(url, extra_headers=headers, open_timeout=15)
+
+        def send(payload: Dict[str, Any]) -> None:
+            ws.send(json.dumps(payload))
+
+        audio_out = bytearray()
+        transcript_parts: List[str] = []
+        tool_calls: List[Dict[str, Any]] = []
+        pending_tool_calls: Dict[str, Dict[str, Any]] = {}
+        completed_tool_call_ids: set[str] = set()
+        event_counts: Dict[str, int] = {}
+        timeout = float(os.getenv("OPENAI_REALTIME_TIMEOUT", "45"))
+        start = time.monotonic()
+        try:
+            send({
+                "type": "session.update",
+                "session": {
+                    "type": "realtime",
+                    "instructions": instructions,
+                    "audio": {
+                        "input": {"format": {"type": "audio/pcm", "rate": 24000}},
+                        "output": {"voice": voice, "format": {"type": "audio/pcm", "rate": 24000}},
+                    },
+                    "tools": [self._openai_realtime_subagent_tool_schema()],
+                    "tool_choice": "auto",
+                },
+            })
+            send({
+                "type": "conversation.item.create",
+                "item": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{
+                        "type": "input_audio",
+                        "audio": base64.b64encode(realtime_pcm).decode("ascii"),
+                    }],
+                },
+            })
+            send({"type": "response.create", "response": {"output_modalities": ["audio"]}})
+
+            while time.monotonic() - start < timeout:
+                remaining = max(0.1, timeout - (time.monotonic() - start))
+                try:
+                    raw = ws.recv(timeout=remaining)
+                except TypeError:
+                    raw = ws.recv()
+                frame = json.loads(raw) if isinstance(raw, str) else raw
+                if not isinstance(frame, dict):
+                    continue
+                ftype = frame.get("type", "?")
+                event_counts[ftype] = event_counts.get(ftype, 0) + 1
+                if ftype == "error":
+                    raise RuntimeError(f"OpenAI Realtime error: {frame.get('error', frame)}")
+                if ftype in {"response.audio.delta", "response.output_audio.delta"}:
+                    b64 = frame.get("delta") or frame.get("audio") or ""
+                    if b64:
+                        try:
+                            audio_out.extend(base64.b64decode(b64))
+                        except Exception:
+                            pass
+                elif ftype in {"response.audio_transcript.delta", "response.output_audio_transcript.delta"}:
+                    transcript_parts.append(str(frame.get("delta") or ""))
+                elif ftype in {"response.output_item.added", "response.output_item.done"}:
+                    raw_item = frame.get("item")
+                    item: Dict[str, Any] = raw_item if isinstance(raw_item, dict) else {}
+                    if item.get("type") == "function_call" and item.get("name") in {"start_subagent_task", "query_hermes_memory"}:
+                        call_id = str(item.get("call_id") or item.get("id") or "")
+                        pending = pending_tool_calls.setdefault(call_id, {"name": item.get("name"), "arguments": ""})
+                        if item.get("arguments"):
+                            pending["arguments"] = str(item.get("arguments") or "")
+                        if ftype == "response.output_item.done" and call_id not in completed_tool_call_ids:
+                            args = self._parse_realtime_tool_arguments(pending.get("arguments"))
+                            if args.get("task"):
+                                tool_calls.append({"call_id": call_id, "name": item.get("name"), "arguments": args})
+                                completed_tool_call_ids.add(call_id)
+                elif ftype == "response.function_call_arguments.delta":
+                    call_id = str(frame.get("call_id") or frame.get("item_id") or "")
+                    pending = pending_tool_calls.setdefault(call_id, {"name": frame.get("name"), "arguments": ""})
+                    pending["arguments"] = str(pending.get("arguments") or "") + str(frame.get("delta") or "")
+                elif ftype == "response.function_call_arguments.done":
+                    call_id = str(frame.get("call_id") or frame.get("item_id") or "")
+                    pending = pending_tool_calls.setdefault(call_id, {"name": frame.get("name"), "arguments": ""})
+                    if frame.get("arguments"):
+                        pending["arguments"] = str(frame.get("arguments") or "")
+                    if call_id not in completed_tool_call_ids:
+                        args = self._parse_realtime_tool_arguments(pending.get("arguments"))
+                        if args.get("task"):
+                            tool_calls.append({"call_id": call_id, "name": pending.get("name") or "start_subagent_task", "arguments": args})
+                            completed_tool_call_ids.add(call_id)
+                elif ftype in {"response.done", "response.completed", "response.cancelled", "response.failed"}:
+                    break
+        finally:
+            try:
+                ws.close()
+            except Exception:
+                pass
+
+        fallback_path: Optional[str] = None
+        if not audio_out and tool_calls:
+            fallback_text = "I’m starting that in the background. I’ll post the result here when it finishes."
+            fallback_path = self._realtime_fallback_tts_sync(fallback_text, guild_id=guild_id, user_id=user_id)
+            if fallback_path:
+                return {
+                    "success": True,
+                    "file_path": fallback_path,
+                    "transcript": fallback_text,
+                    "audio_bytes": 0,
+                    "events": event_counts,
+                    "model": model,
+                    "voice": voice,
+                    "key_source": key_name,
+                    "tool_calls": tool_calls,
+                }
+
+        if not audio_out:
+            return {"success": False, "error": "Realtime returned no audio", "events": event_counts}
+
+        out_dir = _Path(tempfile.gettempdir()) / "hermes_realtime_voice"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        wav_path = out_dir / f"realtime_reply_{guild_id}_{user_id}_{uuid.uuid4().hex[:10]}.wav"
+        with wave.open(str(wav_path), "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(24000)
+            wav.writeframes(audio_out)
+        return {
+            "success": True,
+            "file_path": str(wav_path),
+            "transcript": "".join(transcript_parts).strip(),
+            "audio_bytes": len(audio_out),
+            "events": event_counts,
+            "model": model,
+            "voice": voice,
+            "key_source": key_name,
+            "tool_calls": tool_calls,
+        }
+
+    async def _run_realtime_subagent_task(
+        self,
+        guild_id: int,
+        user_id: int,
+        args: Dict[str, Any],
+        task_id: str,
+    ) -> None:
+        """Run a Hermes CLI subagent and post the result back to the bound text channel."""
+        task = str(args.get("task") or "").strip()
+        if not task:
+            return
+
+        toolsets = self._infer_realtime_subagent_toolsets(args)
+        prompt = self._build_realtime_subagent_prompt(args, guild_id=guild_id, user_id=user_id)
+        task_type = str(args.get("task_type") or "general").strip().lower()
+        preview = task.replace("\n", " ")[:240]
+        await self._send_realtime_debug_message(
+            guild_id,
+            f"🧵 **[Realtime subagent started]** `{task_id}` ({task_type})\n{preview}",
+        )
+
+        repo_root = _Path(__file__).resolve().parents[3]
+        timeout = float(os.getenv("HERMES_REALTIME_SUBAGENT_TIMEOUT", "1800"))
+        env = os.environ.copy()
+        env.setdefault("HERMES_REALTIME_SUBAGENT", "1")
+        cmd = [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "chat",
+            "-Q",
+            "--source",
+            "discord-realtime-subagent",
+            "-t",
+            toolsets,
+            "-q",
+            prompt,
+        ]
+
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(repo_root),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                await self._send_realtime_debug_message(
+                    guild_id,
+                    f"⏱️ **[Realtime subagent timeout]** `{task_id}` after {int(timeout)}s: {preview}",
+                )
+                return
+
+            stdout = stdout_b.decode(errors="replace").strip()
+            stderr = stderr_b.decode(errors="replace").strip()
+            if proc.returncode == 0:
+                body = stdout or "Subagent finished with no output. Tiny ghost in the shell."
+                prefix = f"✅ **[Realtime subagent done]** `{task_id}`\n"
+            else:
+                body = stdout or stderr or f"Background task exited {proc.returncode}."
+                prefix = f"⚠️ **[Realtime subagent failed]** `{task_id}` exit={proc.returncode}\n"
+            safe_body = body.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+            await self._send_realtime_debug_message(guild_id, prefix + safe_body[:1800])
+            session = getattr(self, "_realtime_sessions", {}).get(guild_id)
+            if session is not None:
+                try:
+                    await session.inject_subagent_result(task_id, body, failed=(proc.returncode != 0))
+                except Exception as relay_exc:
+                    logger.warning("Realtime subagent voice relay failed task_id=%s: %s", task_id, relay_exc, exc_info=True)
+        except Exception as exc:
+            logger.warning("Realtime subagent task failed task_id=%s: %s", task_id, exc, exc_info=True)
+            await self._send_realtime_debug_message(
+                guild_id,
+                f"⚠️ **[Realtime subagent error]** `{task_id}`: {exc}",
+            )
+
+    async def _launch_realtime_subagent_from_tool_call(
+        self,
+        guild_id: int,
+        user_id: int,
+        tool_call: Dict[str, Any],
+    ) -> None:
+        """Schedule a background Hermes subagent for a Realtime tool call."""
+        import uuid
+        args = tool_call.get("arguments") if isinstance(tool_call.get("arguments"), dict) else {}
+        if not args.get("task"):
+            return
+        task_id = f"rt-{guild_id}-{uuid.uuid4().hex[:8]}"
+        task = asyncio.create_task(self._run_realtime_subagent_task(guild_id, user_id, args, task_id))
+        tasks = getattr(self, "_realtime_subagent_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+            self._realtime_subagent_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(lambda t: tasks.discard(t))
+
+    async def _run_realtime_memory_query_task(
+        self,
+        guild_id: int,
+        user_id: int,
+        args: Dict[str, Any],
+        query_id: str,
+    ) -> None:
+        """Ask memory/session-search in a background CLI worker and relay through Realtime."""
+        query = str(args.get("query") or "").strip()
+        if not query:
+            return
+        context = str(args.get("context") or "").strip()
+        preview = query.replace("\n", " ")[:240]
+        await self._send_realtime_debug_message(guild_id, f"🧠 **[Realtime memory query]** `{query_id}`\n{preview}")
+        repo_root = _Path(__file__).resolve().parents[3]
+        timeout = float(os.getenv("HERMES_REALTIME_MEMORY_TIMEOUT", "180"))
+        prompt = (
+            "You are answering a memory-dependent question for Joe from Discord Realtime voice.\n"
+            "Use available memory/session_search/user profile context directly. Do not edit memory.\n"
+            "Always search past sessions for concrete project/conversation names before saying memory is insufficient; try exact nouns and short variants from the question.\n"
+            "Return a concise answer suitable for spoken relay. If memory is insufficient after searching, say so plainly.\n\n"
+            f"QUESTION:\n{query}\n\n"
+            f"VOICE CONTEXT:\n{context or 'None provided.'}\n"
+        )
+        cmd = [
+            sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "chat",
+            "-Q",
+            "--source",
+            "discord-realtime-memory",
+            "-t",
+            "memory,session_search",
+            "-q",
+            prompt,
+        ]
+        failed = False
+        body = ""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=str(repo_root),
+                env=os.environ.copy(),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                failed = True
+                body = f"Memory lookup timed out after {int(timeout)} seconds."
+            else:
+                stdout = stdout_b.decode(errors="replace").strip()
+                stderr = stderr_b.decode(errors="replace").strip()
+                failed = proc.returncode != 0
+                body = stdout or stderr or "Memory lookup returned no output."
+        except Exception as exc:
+            failed = True
+            body = f"Memory lookup failed: {exc}"
+        safe_body = body.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+        prefix = "⚠️ **[Realtime memory failed]**" if failed else "✅ **[Realtime memory ready]**"
+        await self._send_realtime_debug_message(guild_id, f"{prefix} `{query_id}`\n{safe_body[:1800]}")
+        session = getattr(self, "_realtime_sessions", {}).get(guild_id)
+        if session is not None:
+            try:
+                await session.inject_memory_result(query_id, body, failed=failed)
+            except Exception as relay_exc:
+                logger.warning("Realtime memory voice relay failed query_id=%s: %s", query_id, relay_exc, exc_info=True)
+
+    async def _launch_realtime_memory_query_from_tool_call(
+        self,
+        guild_id: int,
+        user_id: int,
+        tool_call: Dict[str, Any],
+    ) -> None:
+        """Schedule a background Hermes memory lookup for a Realtime tool call."""
+        import uuid
+        raw_args = tool_call.get("arguments")
+        args: Dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
+        if not args.get("query"):
+            return
+        query_id = f"mem-{guild_id}-{uuid.uuid4().hex[:8]}"
+        task = asyncio.create_task(self._run_realtime_memory_query_task(guild_id, user_id, args, query_id))
+        tasks = getattr(self, "_realtime_subagent_tasks", None)
+        if not isinstance(tasks, set):
+            tasks = set()
+            self._realtime_subagent_tasks = tasks
+        tasks.add(task)
+        task.add_done_callback(lambda t: tasks.discard(t))
+
+    async def _process_realtime_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes) -> None:
+        """Process one completed utterance through a persistent OpenAI Realtime session."""
+        session = getattr(self, "_realtime_sessions", {}).get(guild_id)
+        if session is None:
+            session = OpenAIRealtimeSessionManager(self, guild_id)
+            self._realtime_sessions[guild_id] = session
+        try:
+            result = await session.send_user_audio(user_id, pcm_data)
+            if not result.get("success"):
+                logger.warning("OpenAI Realtime voice turn failed: %s", result.get("error"))
+                await self._send_realtime_debug_message(
+                    guild_id,
+                    f"OpenAI Realtime failed: {result.get('error') or 'unknown error'}",
+                )
+        except Exception as e:
+            logger.warning("OpenAI Realtime voice processing failed: %s", e, exc_info=True)
+            await self._send_realtime_debug_message(guild_id, f"OpenAI Realtime error: {e}")
+
+    async def _send_realtime_debug_message(self, guild_id: int, text: str) -> None:
+        text_ch_id = self._voice_text_channels.get(guild_id)
+        if not text_ch_id or not self._client:
+            return
+        try:
+            channel = self._client.get_channel(text_ch_id)
+            if channel:
+                await channel.send(text[:2000])
+        except Exception:
+            pass
 
     async def get_user_voice_channel(self, guild_id: int, user_id: str):
         """Return the voice channel the user is currently in, or None."""
