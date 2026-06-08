@@ -28,7 +28,6 @@ from typing import Callable, Dict, List, Optional, Any, Tuple
 
 logger = logging.getLogger(__name__)
 
-
 class _Snowflake:
     """Minimal object exposing ``.id`` — satisfies discord.py's Snowflake
     protocol for ``channel.history(before=...)`` without constructing a
@@ -40,6 +39,73 @@ class _Snowflake:
 
     def __init__(self, id: int) -> None:  # noqa: A002 - matches discord API
         self.id = id
+
+
+_REALTIME_LATENCY_SKIP_FIELDS = {
+    "api_key",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+    "pcm_data",
+    "payload",
+    "raw_audio",
+}
+
+
+def _format_realtime_latency_fields(fields: Dict[str, Any]) -> str:
+    """Return stable key=value latency fields without secrets or raw audio."""
+    parts: List[str] = []
+    for key in sorted(fields):
+        key_s = str(key).strip()
+        if not key_s:
+            continue
+        key_l = key_s.lower()
+        if key_l in _REALTIME_LATENCY_SKIP_FIELDS or key_l.endswith("_key"):
+            continue
+        value = fields[key]
+        if value is None:
+            continue
+        if isinstance(value, float):
+            value_s = f"{value:.1f}"
+        elif isinstance(value, bool):
+            value_s = "true" if value else "false"
+        else:
+            value_s = str(value)
+        value_s = value_s.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+        value_s = re.sub(r"\s+", "_", value_s.strip())
+        value_s = re.sub(r"[^A-Za-z0-9_.:/=,+@\-]", "_", value_s)
+        if len(value_s) > 160:
+            value_s = value_s[:159] + "…"
+        parts.append(f"{key_s}={value_s}")
+    return " ".join(parts)
+
+
+def _log_realtime_latency(stage: str, **fields: Any) -> None:
+    field_line = _format_realtime_latency_fields(fields)
+    if field_line:
+        logger.info("realtime_latency stage=%s %s", stage, field_line)
+    else:
+        logger.info("realtime_latency stage=%s", stage)
+
+
+class _RealtimeLatencySpan:
+    """Small monotonic timer for grep-friendly Realtime voice latency logs."""
+
+    def __init__(self, operation: str, **fields: Any):
+        self.operation = operation
+        self.fields = fields
+        self.started_at = time.monotonic()
+
+    def elapsed_ms(self) -> float:
+        return (time.monotonic() - self.started_at) * 1000.0
+
+    def log(self, stage: str, **fields: Any) -> None:
+        merged = {"operation": self.operation, **self.fields, **fields, "duration_ms": self.elapsed_ms()}
+        _log_realtime_latency(stage, **merged)
+
+    def finish(self, stage: Optional[str] = None, **fields: Any) -> None:
+        self.log(stage or f"{self.operation}_done", **fields)
 
 VALID_THREAD_AUTO_ARCHIVE_MINUTES = {60, 1440, 4320, 10080}
 _DISCORD_COMMAND_SYNC_POLICIES = {"safe", "bulk", "off"}
@@ -417,6 +483,7 @@ class VoiceReceiver:
         # Per-user audio buffers
         self._buffers: Dict[int, bytearray] = defaultdict(bytearray)
         self._last_packet_time: Dict[int, float] = {}
+        self._buffer_started_at: Dict[int, float] = {}
 
         # Opus decoder per SSRC (each user needs own decoder state)
         self._decoders: Dict[int, object] = {}
@@ -453,6 +520,7 @@ class VoiceReceiver:
         with self._lock:
             self._buffers.clear()
             self._last_packet_time.clear()
+            self._buffer_started_at.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
         logger.info("VoiceReceiver stopped")
@@ -636,8 +704,20 @@ class VoiceReceiver:
                 self._decoders[ssrc] = discord.opus.Decoder()
             pcm = self._decoders[ssrc].decode(decrypted)
             with self._lock:
+                was_empty = not self._buffers.get(ssrc)
+                now = time.monotonic()
                 self._buffers[ssrc].extend(pcm)
-                self._last_packet_time[ssrc] = time.monotonic()
+                self._last_packet_time[ssrc] = now
+                if was_empty:
+                    self._buffer_started_at[ssrc] = now
+                    _log_realtime_latency(
+                        "voice_buffer_start",
+                        ssrc=ssrc,
+                        user_id=self._ssrc_to_user.get(ssrc, 0) or "unknown",
+                        packet_seq=seq,
+                        packet_bytes=len(data),
+                        pcm_bytes=len(pcm),
+                    )
         except Exception as e:
             with self._lock:
                 self._decoders.pop(ssrc, None)
@@ -691,6 +771,7 @@ class VoiceReceiver:
                 last_time = self._last_packet_time.get(ssrc, now)
                 silence_duration = now - last_time
                 buf = self._buffers[ssrc]
+                started_at = self._buffer_started_at.get(ssrc, last_time)
                 # 48kHz, 16-bit, stereo = 192000 bytes/sec
                 buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
 
@@ -708,8 +789,19 @@ class VoiceReceiver:
                             rms,
                             self.MIN_RMS,
                         )
+                        _log_realtime_latency(
+                            "voice_buffer_discard",
+                            reason="quiet",
+                            ssrc=ssrc,
+                            duration_ms=(now - started_at) * 1000.0,
+                            silence_ms=silence_duration * 1000.0,
+                            audio_ms=buf_duration * 1000.0,
+                            pcm_bytes=len(buf),
+                            rms=rms,
+                        )
                         self._buffers[ssrc] = bytearray()
                         self._last_packet_time.pop(ssrc, None)
+                        self._buffer_started_at.pop(ssrc, None)
                         continue
                     user_id = ssrc_user_map.get(ssrc, 0)
                     if not user_id:
@@ -718,12 +810,32 @@ class VoiceReceiver:
                         user_id = self._infer_user_for_ssrc(ssrc)
                     if user_id:
                         completed.append((user_id, bytes(buf)))
+                    _log_realtime_latency(
+                        "voice_buffer_commit",
+                        ssrc=ssrc,
+                        user_id=user_id or "unknown",
+                        duration_ms=(now - started_at) * 1000.0,
+                        silence_ms=silence_duration * 1000.0,
+                        audio_ms=buf_duration * 1000.0,
+                        pcm_bytes=len(buf),
+                        rms=rms,
+                    )
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
+                    self._buffer_started_at.pop(ssrc, None)
                 elif silence_duration >= self.SILENCE_THRESHOLD * 2:
                     # Stale buffer with no valid user — discard
+                    _log_realtime_latency(
+                        "voice_buffer_discard",
+                        reason="stale",
+                        ssrc=ssrc,
+                        duration_ms=(now - started_at) * 1000.0,
+                        silence_ms=silence_duration * 1000.0,
+                        pcm_bytes=len(buf),
+                    )
                     self._buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
+                    self._buffer_started_at.pop(ssrc, None)
 
         return completed
 
@@ -934,7 +1046,12 @@ class OpenAIRealtimeSessionManager:
         self.key_source = key_name
         self._connected = True
         instructions = self.default_instructions()
-        memory_context = self.adapter._build_realtime_memory_context(self.guild_id)
+        memory_context = ""
+        memory_span = _RealtimeLatencySpan("memory_context_build", guild_id=self.guild_id)
+        try:
+            memory_context = self.adapter._build_realtime_memory_context(self.guild_id)
+        finally:
+            memory_span.finish("memory_context_ready", chars=len(memory_context or ""))
         if memory_context:
             instructions = (
                 f"{instructions}\n\n"
@@ -959,6 +1076,12 @@ class OpenAIRealtimeSessionManager:
                 "tool_choice": "auto",
             },
         })
+        _log_realtime_latency(
+            "memory_context_inject",
+            guild_id=self.guild_id,
+            memory_chars=len(memory_context or ""),
+            instructions_chars=len(instructions),
+        )
         logger.info(
             "OpenAI Realtime persistent session started guild=%s model=%s voice=%s key_source=%s",
             self.guild_id,
@@ -979,13 +1102,33 @@ class OpenAIRealtimeSessionManager:
         logger.info("OpenAI Realtime persistent session stopped guild=%s", self.guild_id)
 
     async def send_user_audio(self, user_id: int, pcm_data: bytes) -> Dict[str, Any]:
+        turn_span = _RealtimeLatencySpan(
+            "send_user_audio",
+            guild_id=self.guild_id,
+            user_id=user_id,
+            input_bytes=len(pcm_data),
+        )
         async with self._turn_lock:
             try:
                 await self.start()
+                conversion_span = _RealtimeLatencySpan(
+                    "send_user_audio_conversion",
+                    guild_id=self.guild_id,
+                    user_id=user_id,
+                    input_bytes=len(pcm_data),
+                )
                 realtime_pcm = self.adapter._discord_pcm_to_realtime_pcm(pcm_data)
+                conversion_span.finish("send_user_audio_converted", output_bytes=len(realtime_pcm or b""))
                 if not realtime_pcm:
+                    turn_span.finish("send_user_audio_empty", success=False)
                     return {"success": False, "error": "empty realtime PCM after conversion"}
                 import base64
+                send_span = _RealtimeLatencySpan(
+                    "send_user_audio_send",
+                    guild_id=self.guild_id,
+                    user_id=user_id,
+                    output_bytes=len(realtime_pcm),
+                )
                 await self._send({
                     "type": "conversation.item.create",
                     "item": {
@@ -997,8 +1140,17 @@ class OpenAIRealtimeSessionManager:
                         }],
                     },
                 })
-                return await self._run_response(user_id=user_id)
+                send_span.finish("send_user_audio_sent")
+                result = await self._run_response(user_id=user_id, turn_started_at=turn_span.started_at)
+                turn_span.finish(
+                    "send_user_audio_done",
+                    success=bool(result.get("success")),
+                    audio_bytes=result.get("audio_bytes", 0),
+                    tool_calls=len(result.get("tool_calls") or []),
+                )
+                return result
             except Exception:
+                turn_span.finish("send_user_audio_error", success=False)
                 # If the persistent socket got stale, reset it so the next
                 # utterance can reconnect cleanly instead of wedging voice.
                 await self.stop()
@@ -1032,6 +1184,13 @@ class OpenAIRealtimeSessionManager:
                 raise
 
     async def inject_memory_result(self, query_id: str, result: str, *, failed: bool = False) -> Dict[str, Any]:
+        inject_span = _RealtimeLatencySpan(
+            "memory_inject",
+            guild_id=self.guild_id,
+            query_id=query_id,
+            failed=failed,
+            result_chars=len(result or ""),
+        )
         async with self._turn_lock:
             try:
                 await self.start()
@@ -1053,8 +1212,16 @@ class OpenAIRealtimeSessionManager:
                         }],
                     },
                 })
-                return await self._run_response(user_id=0)
+                inject_span.log("memory_inject_sent", safe_chars=len(safe))
+                response = await self._run_response(user_id=0, turn_started_at=inject_span.started_at)
+                inject_span.finish(
+                    "memory_inject_done",
+                    success=bool(response.get("success")),
+                    audio_bytes=response.get("audio_bytes", 0),
+                )
+                return response
             except Exception:
+                inject_span.finish("memory_inject_error", success=False)
                 await self.stop()
                 raise
 
@@ -1120,9 +1287,10 @@ class OpenAIRealtimeSessionManager:
             return None
         return self._write_audio_wav(audio_out, user_id=user_id)
 
-    async def _run_response(self, *, user_id: int) -> Dict[str, Any]:
+    async def _run_response(self, *, user_id: int, turn_started_at: Optional[float] = None) -> Dict[str, Any]:
         if not self.ws:
             return {"success": False, "error": "Realtime WebSocket is not connected"}
+        response_span = _RealtimeLatencySpan("realtime_response", guild_id=self.guild_id, user_id=user_id)
         audio_out = bytearray()
         transcript_parts: List[str] = []
         tool_calls: List[Dict[str, Any]] = []
@@ -1131,8 +1299,11 @@ class OpenAIRealtimeSessionManager:
         event_counts: Dict[str, int] = {}
         timeout = float(os.getenv("OPENAI_REALTIME_TIMEOUT", "45"))
         start = time.monotonic()
+        saw_first_event = False
+        saw_first_audio = False
 
         await self._send({"type": "response.create", "response": {"output_modalities": ["audio"]}})
+        response_span.log("realtime_response_create_sent")
         while time.monotonic() - start < timeout:
             remaining = max(0.1, timeout - (time.monotonic() - start))
             raw = await asyncio.wait_for(self.ws.recv(), timeout=remaining)
@@ -1141,6 +1312,13 @@ class OpenAIRealtimeSessionManager:
                 continue
             ftype = frame.get("type", "?")
             event_counts[ftype] = event_counts.get(ftype, 0) + 1
+            if not saw_first_event:
+                saw_first_event = True
+                response_span.log(
+                    "realtime_first_event",
+                    event_type=ftype,
+                    turn_elapsed_ms=((time.monotonic() - turn_started_at) * 1000.0) if turn_started_at else None,
+                )
             if ftype == "error":
                 raise RuntimeError(f"OpenAI Realtime error: {frame.get('error', frame)}")
             if ftype in {"response.audio.delta", "response.output_audio.delta"}:
@@ -1148,7 +1326,17 @@ class OpenAIRealtimeSessionManager:
                 if b64:
                     try:
                         import base64
-                        audio_out.extend(base64.b64decode(b64))
+                        chunk = base64.b64decode(b64)
+                        audio_out.extend(chunk)
+                        if not saw_first_audio:
+                            saw_first_audio = True
+                            response_span.log(
+                                "realtime_first_audio_delta",
+                                event_type=ftype,
+                                chunk_bytes=len(chunk),
+                                audio_bytes=len(audio_out),
+                                turn_elapsed_ms=((time.monotonic() - turn_started_at) * 1000.0) if turn_started_at else None,
+                            )
                     except Exception:
                         pass
             elif ftype in {"response.audio_transcript.delta", "response.output_audio_transcript.delta"}:
@@ -1163,6 +1351,7 @@ class OpenAIRealtimeSessionManager:
                         pending["arguments"] = str(item.get("arguments") or "")
                     if ftype == "response.output_item.done" and call_id not in completed_tool_call_ids:
                         args = self.adapter._parse_realtime_tool_arguments(pending.get("arguments"))
+                        before_count = len(tool_calls)
                         self._append_realtime_tool_call(
                             tool_calls,
                             completed_tool_call_ids,
@@ -1170,6 +1359,13 @@ class OpenAIRealtimeSessionManager:
                             item.get("name") or pending.get("name"),
                             args,
                         )
+                        if len(tool_calls) > before_count:
+                            response_span.log(
+                                "realtime_tool_call_done",
+                                call_id=call_id,
+                                tool_name=tool_calls[-1].get("name"),
+                                tool_calls=len(tool_calls),
+                            )
             elif ftype == "response.function_call_arguments.delta":
                 call_id = str(frame.get("call_id") or frame.get("item_id") or "")
                 pending = pending_tool_calls.setdefault(call_id, {"name": frame.get("name"), "arguments": ""})
@@ -1181,6 +1377,7 @@ class OpenAIRealtimeSessionManager:
                     pending["arguments"] = str(frame.get("arguments") or "")
                 if call_id not in completed_tool_call_ids:
                     args = self.adapter._parse_realtime_tool_arguments(pending.get("arguments"))
+                    before_count = len(tool_calls)
                     self._append_realtime_tool_call(
                         tool_calls,
                         completed_tool_call_ids,
@@ -1188,9 +1385,26 @@ class OpenAIRealtimeSessionManager:
                         pending.get("name") or frame.get("name"),
                         args,
                     )
+                    if len(tool_calls) > before_count:
+                        response_span.log(
+                            "realtime_tool_call_done",
+                            call_id=call_id,
+                            tool_name=tool_calls[-1].get("name"),
+                            tool_calls=len(tool_calls),
+                        )
             elif ftype in {"response.done", "response.completed", "response.cancelled", "response.failed"}:
+                response_span.finish(
+                    "realtime_response_done",
+                    event_type=ftype,
+                    audio_bytes=len(audio_out),
+                    transcript_chars=sum(len(p) for p in transcript_parts),
+                    tool_calls=len(tool_calls),
+                    event_types=len(event_counts),
+                    turn_elapsed_ms=((time.monotonic() - turn_started_at) * 1000.0) if turn_started_at else None,
+                )
                 break
         else:
+            response_span.finish("realtime_response_timeout", audio_bytes=len(audio_out), event_types=len(event_counts))
             return {"success": False, "error": "Realtime response timed out", "events": event_counts}
 
         transcript = "".join(transcript_parts).strip()
@@ -3394,18 +3608,30 @@ class DiscordAdapter(BasePlatformAdapter):
         """
         vc = self._voice_clients.get(guild_id)
         if not vc or not vc.is_connected():
+            _log_realtime_latency("discord_playback_enqueue", guild_id=guild_id, connected=False)
             return False
 
         # ── Mixer path (overlap + ducking) ──────────────────────────────
         mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
+        playback_span = _RealtimeLatencySpan(
+            "discord_playback",
+            guild_id=guild_id,
+            backend="mixer" if mixer is not None else "legacy",
+            audio_ext=_Path(audio_path).suffix.lstrip(".") or "unknown",
+            file_bytes=os.path.getsize(audio_path) if os.path.exists(audio_path) else 0,
+        )
+        playback_span.log("discord_playback_enqueue")
         if mixer is not None:
             try:
                 from voice_mixer import decode_to_pcm
             except ImportError:
                 from .voice_mixer import decode_to_pcm
+            decode_span = _RealtimeLatencySpan("discord_playback_decode", guild_id=guild_id, backend="mixer")
             pcm = await asyncio.to_thread(decode_to_pcm, audio_path)
+            decode_span.finish("discord_playback_decode_done", pcm_bytes=len(pcm or b""))
             if pcm:
                 speech_gain = float(self._voice_fx_cfg.get("speech_gain", 1.0))
+                playback_span.log("discord_playback_start", pcm_bytes=len(pcm), speech_gain=speech_gain)
                 mixer.play_speech(pcm, gain=speech_gain)
                 # Block until the speech child drains so callers serialise
                 # replies (mirrors legacy semantics) but the ambient keeps
@@ -3414,12 +3640,23 @@ class DiscordAdapter(BasePlatformAdapter):
                 while mixer.speech_active:
                     if time.monotonic() - wait_start > self.PLAYBACK_TIMEOUT:
                         logger.warning("Mixer speech playback timed out after %ds", self.PLAYBACK_TIMEOUT)
+                        playback_span.log("discord_playback_timeout", timeout_s=self.PLAYBACK_TIMEOUT)
                         mixer.stop_speech()
                         break
                     await asyncio.sleep(0.05)
                 self._reset_voice_timeout(guild_id)
+                playback_span.finish("discord_playback_done")
                 return True
             logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
+            playback_span.log("discord_playback_decode_empty")
+            playback_span = _RealtimeLatencySpan(
+                "discord_playback",
+                guild_id=guild_id,
+                backend="legacy_fallback",
+                audio_ext=_Path(audio_path).suffix.lstrip(".") or "unknown",
+                file_bytes=os.path.getsize(audio_path) if os.path.exists(audio_path) else 0,
+            )
+            playback_span.log("discord_playback_fallback_enqueue")
 
         # ── Legacy one-shot path (no mixer) ─────────────────────────────
         # Pause voice receiver while playing (echo prevention)
@@ -3430,12 +3667,17 @@ class DiscordAdapter(BasePlatformAdapter):
         try:
             # Wait for current playback to finish (with timeout)
             wait_start = time.monotonic()
+            waited_for_previous = False
             while vc.is_playing():
+                waited_for_previous = True
                 if time.monotonic() - wait_start > self.PLAYBACK_TIMEOUT:
                     logger.warning("Timed out waiting for previous playback to finish")
+                    playback_span.log("discord_playback_previous_timeout", timeout_s=self.PLAYBACK_TIMEOUT)
                     vc.stop()
                     break
                 await asyncio.sleep(0.1)
+            if waited_for_previous:
+                playback_span.log("discord_playback_previous_done", wait_ms=(time.monotonic() - wait_start) * 1000.0)
 
             done = asyncio.Event()
             loop = asyncio.get_running_loop()
@@ -3447,11 +3689,14 @@ class DiscordAdapter(BasePlatformAdapter):
 
             source = discord.FFmpegPCMAudio(audio_path)
             source = discord.PCMVolumeTransformer(source, volume=1.0)
+            playback_span.log("discord_playback_start")
             vc.play(source, after=_after)
             try:
                 await asyncio.wait_for(done.wait(), timeout=self.PLAYBACK_TIMEOUT)
+                playback_span.finish("discord_playback_done")
             except asyncio.TimeoutError:
                 logger.warning("Voice playback timed out after %ds", self.PLAYBACK_TIMEOUT)
+                playback_span.finish("discord_playback_timeout", timeout_s=self.PLAYBACK_TIMEOUT)
                 vc.stop()
             self._reset_voice_timeout(guild_id)
             return True
@@ -4083,8 +4328,16 @@ class DiscordAdapter(BasePlatformAdapter):
         query = str(args.get("query") or "").strip()
         if not query:
             return
+        query_span = _RealtimeLatencySpan(
+            "memory_query",
+            guild_id=guild_id,
+            user_id=user_id,
+            query_id=query_id,
+            query_chars=len(query),
+        )
         context = str(args.get("context") or "").strip()
         preview = query.replace("\n", " ")[:240]
+        query_span.log("memory_query_start", context_chars=len(context))
         await self._send_realtime_debug_message(guild_id, f"🧠 **[Realtime memory query]** `{query_id}`\n{preview}")
         repo_root = _Path(__file__).resolve().parents[3]
         timeout = float(os.getenv("HERMES_REALTIME_MEMORY_TIMEOUT", "180"))
@@ -4111,6 +4364,7 @@ class DiscordAdapter(BasePlatformAdapter):
         ]
         failed = False
         body = ""
+        retrieval_span = _RealtimeLatencySpan("memory_retrieval", guild_id=guild_id, user_id=user_id, query_id=query_id)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -4126,23 +4380,38 @@ class DiscordAdapter(BasePlatformAdapter):
                 await proc.wait()
                 failed = True
                 body = f"Memory lookup timed out after {int(timeout)} seconds."
+                retrieval_span.finish("memory_retrieval_done", success=False, timed_out=True, exit_code="timeout")
             else:
                 stdout = stdout_b.decode(errors="replace").strip()
                 stderr = stderr_b.decode(errors="replace").strip()
                 failed = proc.returncode != 0
                 body = stdout or stderr or "Memory lookup returned no output."
+                retrieval_span.finish(
+                    "memory_retrieval_done",
+                    success=not failed,
+                    exit_code=proc.returncode,
+                    stdout_chars=len(stdout),
+                    stderr_chars=len(stderr),
+                )
         except Exception as exc:
             failed = True
             body = f"Memory lookup failed: {exc}"
+            retrieval_span.finish("memory_retrieval_done", success=False, error_type=type(exc).__name__)
+        synthesis_span = _RealtimeLatencySpan("memory_synthesis", guild_id=guild_id, user_id=user_id, query_id=query_id)
         safe_body = body.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+        synthesis_span.finish("memory_synthesis_done", failed=failed, body_chars=len(body), safe_chars=len(safe_body))
         prefix = "⚠️ **[Realtime memory failed]**" if failed else "✅ **[Realtime memory ready]**"
         await self._send_realtime_debug_message(guild_id, f"{prefix} `{query_id}`\n{safe_body[:1800]}")
         session = getattr(self, "_realtime_sessions", {}).get(guild_id)
         if session is not None:
             try:
+                inject_start = time.monotonic()
                 await session.inject_memory_result(query_id, body, failed=failed)
+                query_span.log("memory_query_inject_done", inject_ms=(time.monotonic() - inject_start) * 1000.0)
             except Exception as relay_exc:
+                query_span.log("memory_query_inject_done", success=False, error_type=type(relay_exc).__name__)
                 logger.warning("Realtime memory voice relay failed query_id=%s: %s", query_id, relay_exc, exc_info=True)
+        query_span.finish("memory_query_done", failed=failed, body_chars=len(body))
 
     async def _launch_realtime_memory_query_from_tool_call(
         self,

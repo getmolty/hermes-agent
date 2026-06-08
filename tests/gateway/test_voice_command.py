@@ -596,6 +596,87 @@ class TestDiscordPlayTtsSkip:
         assert result.success is False
 
 
+class TestDiscordOpenAIRealtimeVoiceEngine:
+    """Unit tests for the Discord OpenAI Realtime voice engine selector."""
+
+    def _make_discord_adapter(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+        from gateway.config import Platform, PlatformConfig
+        config = PlatformConfig(enabled=True, extra={})
+        config.token = "fake-token"
+        adapter = object.__new__(DiscordAdapter)
+        adapter.platform = Platform.DISCORD
+        adapter.config = config
+        adapter._voice_engines = {}
+        adapter._realtime_locks = {}
+        adapter._voice_text_channels = {}
+        adapter._client = None
+        return adapter
+
+    def test_set_voice_engine_normalizes_realtime_aliases(self):
+        adapter = self._make_discord_adapter()
+
+        adapter.set_voice_engine(111, "realtime")
+
+        assert adapter.get_voice_engine(111) == "openai_realtime"
+
+    def test_discord_pcm_to_realtime_pcm_converts_rate_and_channels(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        # 1 second of Discord-native silence: 48kHz, stereo, 16-bit.
+        pcm = b"\x00\x00" * 48000 * 2
+
+        converted = DiscordAdapter._discord_pcm_to_realtime_pcm(pcm)
+
+        # 1 second of OpenAI input audio: 24kHz, mono, 16-bit.
+        assert len(converted) == 24000 * 2
+
+    def test_realtime_latency_log_fields_are_grep_friendly_and_redacted(self):
+        from plugins.platforms.discord.adapter import _format_realtime_latency_fields
+
+        line = _format_realtime_latency_fields(
+            {
+                "guild_id": 111,
+                "duration_ms": 12.345,
+                "event_type": "response.done",
+                "api_key": "sk-secret",
+                "note": "hello world",
+            }
+        )
+
+        assert "guild_id=111" in line
+        assert "duration_ms=12.3" in line
+        assert "event_type=response.done" in line
+        assert "note=hello_world" in line
+        assert "sk-secret" not in line
+        assert "api_key" not in line
+
+    def test_realtime_latency_span_emits_duration(self, caplog, monkeypatch):
+        from plugins.platforms.discord import adapter as discord_adapter
+
+        times = iter([10.0, 10.125])
+        monkeypatch.setattr(discord_adapter.time, "monotonic", lambda: next(times))
+
+        with caplog.at_level("INFO", logger="plugins.platforms.discord.adapter"):
+            span = discord_adapter._RealtimeLatencySpan("send_user_audio", guild_id=111, user_id=42)
+            span.finish("audio_sent", bytes=4800)
+
+        assert "realtime_latency stage=audio_sent" in caplog.text
+        assert "operation=send_user_audio" in caplog.text
+        assert "duration_ms=125.0" in caplog.text
+        assert "bytes=4800" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_process_voice_input_routes_to_realtime_engine(self):
+        adapter = self._make_discord_adapter()
+        adapter.set_voice_engine(111, "openai_realtime")
+        adapter._process_realtime_voice_input = AsyncMock()
+
+        await adapter._process_voice_input(111, 42, b"\x00" * 96000)
+
+        adapter._process_realtime_voice_input.assert_awaited_once_with(111, 42, b"\x00" * 96000)
+
+
 # =====================================================================
 # Web play_tts sends play_audio (not voice bubble)
 # =====================================================================
