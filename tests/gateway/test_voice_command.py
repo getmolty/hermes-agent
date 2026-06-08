@@ -1,5 +1,6 @@
 """Tests for the /voice command and auto voice reply in the gateway."""
 
+import asyncio
 import importlib
 import importlib.util
 import json
@@ -3106,6 +3107,99 @@ class TestOpenAIRealtimeSubagentBridge:
         assert "live-secret" not in digest
         assert "[REDACTED]" in digest
         assert "query_hermes_memory" in digest
+
+    def test_realtime_memory_broker_answers_simple_profile_query_without_cli(self, tmp_path, monkeypatch):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        home = tmp_path / "hermes-home"
+        memories = home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "USER.md").write_text(
+            "User is Joe Ross.\nUser prefers terse operator language.\nsk-proj-secret123456\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        subprocess_spy = MagicMock(side_effect=AssertionError("CLI must not spawn"))
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", subprocess_spy)
+
+        result = DiscordAdapter._answer_realtime_memory_query_sync(
+            "What communication style does Joe prefer?",
+            context="voice",
+        )
+
+        assert result["success"] is True
+        assert result["route"] == "memory_files"
+        assert "terse operator language" in result["body"]
+        assert "secret123456" not in result["body"]
+        assert "[REDACTED]" in result["body"]
+        subprocess_spy.assert_not_called()
+
+    def test_realtime_memory_broker_routes_concrete_project_query_to_session_search(self, monkeypatch):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        def fake_session_search(**kwargs):
+            assert kwargs["query"] == "Where did we leave the Bourbon app?"
+            return json.dumps({
+                "success": True,
+                "results": [{
+                    "title": "Bourbon app handoff",
+                    "snippet": "Repo lives under Desktop/Bourbon and tests were green.",
+                    "messages": [{"role": "assistant", "content": "Next step is review the PR."}],
+                }],
+            })
+
+        monkeypatch.setattr(DiscordAdapter, "_call_realtime_session_search", staticmethod(fake_session_search))
+
+        result = DiscordAdapter._answer_realtime_memory_query_sync("Where did we leave the Bourbon app?")
+
+        assert result["success"] is True
+        assert result["route"] == "session_search"
+        assert "Bourbon app handoff" in result["body"]
+        assert "Desktop/Bourbon" in result["body"]
+
+    def test_realtime_memory_broker_falls_back_for_deep_queries(self, tmp_path, monkeypatch):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        home = tmp_path / "hermes-home"
+        (home / "memories").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        result = DiscordAdapter._answer_realtime_memory_query_sync(
+            "Synthesize my last month of infrastructure decisions and rank the tradeoffs."
+        )
+
+        assert result["success"] is False
+        assert result["route"] == "cli_fallback"
+
+    @pytest.mark.asyncio
+    async def test_realtime_memory_query_task_uses_broker_no_subprocess_for_simple_query(self, tmp_path, monkeypatch):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        home = tmp_path / "hermes-home"
+        memories = home / "memories"
+        memories.mkdir(parents=True)
+        (memories / "USER.md").write_text("User prefers English-only Telegram.\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        subprocess_spy = MagicMock(side_effect=AssertionError("CLI must not spawn"))
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", subprocess_spy)
+
+        adapter = self._make_adapter()
+        adapter._send_realtime_debug_message = AsyncMock()
+        fake_session = SimpleNamespace(inject_memory_result=AsyncMock())
+        adapter._realtime_sessions[111] = fake_session
+
+        await adapter._run_realtime_memory_query_task(
+            111,
+            42,
+            {"query": "What language does Joe prefer on Telegram?"},
+            "mem-test",
+        )
+
+        subprocess_spy.assert_not_called()
+        injected = fake_session.inject_memory_result.await_args.args
+        assert injected[0] == "mem-test"
+        assert "English-only Telegram" in injected[1]
+        assert fake_session.inject_memory_result.await_args.kwargs == {"failed": False}
 
     @pytest.mark.asyncio
     async def test_persistent_realtime_session_update_includes_memory_context(self, monkeypatch):

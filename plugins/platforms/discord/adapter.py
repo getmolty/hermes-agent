@@ -3758,6 +3758,172 @@ class DiscordAdapter(BasePlatformAdapter):
             return safe
         return safe[: max(0, max_chars - 1)].rstrip() + "…"
 
+    @staticmethod
+    def _realtime_memory_home() -> _Path:
+        try:
+            from hermes_constants import get_hermes_home
+            return get_hermes_home()
+        except Exception:
+            return _Path(os.getenv("HERMES_HOME") or _Path.home() / ".hermes")
+
+    @staticmethod
+    def _realtime_memory_query_terms(query: str) -> List[str]:
+        stop = {
+            "about", "after", "again", "does", "from", "have", "hermes", "into",
+            "joe", "know", "like", "memory", "please", "prefer", "query", "that",
+            "this", "what", "when", "where", "which", "with", "would", "your",
+        }
+        terms: List[str] = []
+        for term in re.findall(r"[A-Za-z0-9][A-Za-z0-9_-]{2,}", str(query or "").lower()):
+            if term not in stop:
+                terms.append(term)
+        return list(dict.fromkeys(terms))[:12]
+
+    @staticmethod
+    def _realtime_memory_query_needs_cli(query: str) -> bool:
+        q = str(query or "").lower()
+        deep_markers = (
+            "analyze", "compare", "comprehensive", "deep", "everything", "last month",
+            "last week", "rank", "synthesize", "tradeoff", "trend", "why did",
+        )
+        return any(marker in q for marker in deep_markers)
+
+    @staticmethod
+    def _realtime_memory_query_wants_session_search(query: str) -> bool:
+        q = str(query or "").lower()
+        markers = (
+            "conversation", "did we", "handoff", "last time", "previous", "prior",
+            "project", "session", "thread", "where did we leave",
+        )
+        return any(marker in q for marker in markers)
+
+    @staticmethod
+    def _realtime_memory_query_wants_memory_files(query: str) -> bool:
+        q = str(query or "").lower()
+        markers = (
+            "about me", "communication style", "default", "do i", "language", "like",
+            "my name", "preference", "prefer", "profile", "telegram", "who am i",
+            "who is joe", "want", "what am i", "what do you know about me",
+        )
+        return any(marker in q for marker in markers)
+
+    @staticmethod
+    def _read_realtime_memory_file_matches(query: str, *, max_lines: int = 8) -> Tuple[List[str], bool]:
+        home = DiscordAdapter._realtime_memory_home()
+        mem_dir = home / "memories"
+        terms = DiscordAdapter._realtime_memory_query_terms(query)
+        preference_markers = ("prefer", "like", "want", "default", "style", "language", "telegram")
+        matches: List[str] = []
+        redacted_any = False
+        for label, filename in (("USER.md", "USER.md"), ("MEMORY.md", "MEMORY.md")):
+            path = mem_dir / filename
+            try:
+                raw_text = path.read_text(errors="ignore")[:12000]
+            except Exception:
+                continue
+            safe_text = DiscordAdapter._redact_realtime_memory_context(raw_text)
+            redacted_any = redacted_any or (safe_text != raw_text)
+            for raw_line in safe_text.splitlines():
+                line = raw_line.strip()
+                if not line or line == "§":
+                    continue
+                line_l = line.lower()
+                term_hit = any(term in line_l for term in terms)
+                preference_hit = any(marker in line_l for marker in preference_markers)
+                if term_hit or (not terms and preference_hit) or (preference_hit and DiscordAdapter._realtime_memory_query_wants_memory_files(query)):
+                    bounded = DiscordAdapter._bound_realtime_memory_context(line, 260)
+                    matches.append(f"{label}: {bounded}")
+                    if len(matches) >= max_lines:
+                        break
+            if len(matches) >= max_lines:
+                break
+        return matches, redacted_any
+
+    @staticmethod
+    def _call_realtime_session_search(**kwargs: Any) -> str:
+        from tools.session_search_tool import session_search
+        return session_search(**kwargs)
+
+    @staticmethod
+    def _format_realtime_session_search_answer(result_json: str) -> Optional[str]:
+        try:
+            data = json.loads(result_json) if isinstance(result_json, str) else result_json
+        except Exception:
+            return None
+        if not isinstance(data, dict) or not data.get("success"):
+            return None
+        results = data.get("results")
+        if not isinstance(results, list) or not results:
+            return None
+        lines = ["From session_search:"]
+        for result in results[:3]:
+            if not isinstance(result, dict):
+                continue
+            title = DiscordAdapter._snippet_realtime_memory_context(result.get("title") or "untitled", 90)
+            snippet = DiscordAdapter._snippet_realtime_memory_context(result.get("snippet") or "", 280)
+            if snippet:
+                lines.append(f"- {title}: {snippet}")
+            else:
+                lines.append(f"- {title}")
+            messages = result.get("messages")
+            if isinstance(messages, list):
+                for msg in messages[:2]:
+                    if isinstance(msg, dict) and msg.get("content"):
+                        content = DiscordAdapter._snippet_realtime_memory_context(msg.get("content"), 220)
+                        if content:
+                            lines.append(f"  {msg.get('role') or 'message'}: {content}")
+        body = "\n".join(lines).strip()
+        return DiscordAdapter._bound_realtime_memory_context(body, 1400) if body else None
+
+    @staticmethod
+    def _answer_realtime_memory_query_sync(query: str, context: str = "") -> Dict[str, Any]:
+        """Bounded in-process memory broker for Realtime voice lookups.
+
+        The fast path avoids spawning a full Hermes CLI agent for obvious
+        profile/preference questions and concrete session_search lookups.  Deep
+        synthesis stays on the existing CLI worker fallback.
+        """
+        query = str(query or "").strip()
+        if not query:
+            return {"success": False, "route": "cli_fallback", "body": ""}
+        span = _RealtimeLatencySpan("memory_broker", query_chars=len(query), context_chars=len(str(context or "")))
+        result: Dict[str, Any] = {"success": False, "route": "cli_fallback", "body": ""}
+        try:
+            if DiscordAdapter._realtime_memory_query_needs_cli(query):
+                return result
+
+            if DiscordAdapter._realtime_memory_query_wants_session_search(query):
+                try:
+                    raw = DiscordAdapter._call_realtime_session_search(query=query, limit=3, role_filter="user,assistant")
+                    body = DiscordAdapter._format_realtime_session_search_answer(raw)
+                except Exception as exc:
+                    logger.debug("Realtime memory broker session_search failed: %s", exc, exc_info=True)
+                    body = None
+                if body:
+                    result = {"success": True, "route": "session_search", "body": body}
+                return result
+
+            if DiscordAdapter._realtime_memory_query_wants_memory_files(query):
+                matches, redacted_any = DiscordAdapter._read_realtime_memory_file_matches(query)
+                if matches:
+                    body = "From read-only memory files:\n" + "\n".join(f"- {m}" for m in matches)
+                    if redacted_any:
+                        body += "\n- [REDACTED] secret-like memory text omitted."
+                    body = DiscordAdapter._bound_realtime_memory_context(body, 1200)
+                    result = {"success": True, "route": "memory_files", "body": body}
+                return result
+
+            return result
+        finally:
+            # The caller emits query_id/guild/user scoped logs; this static helper
+            # still logs local route latency for standalone tests and grepability.
+            span.finish(
+                "memory_broker_done",
+                success=bool(result.get("success")),
+                route=str(result.get("route") or "unknown"),
+                body_chars=len(str(result.get("body") or "")),
+            )
+
     def _build_realtime_memory_context(self, guild_id: int) -> str:
         """Build a fast, bounded read-only memory/session digest for Realtime startup.
 
@@ -4365,38 +4531,53 @@ class DiscordAdapter(BasePlatformAdapter):
         failed = False
         body = ""
         retrieval_span = _RealtimeLatencySpan("memory_retrieval", guild_id=guild_id, user_id=user_id, query_id=query_id)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                cwd=str(repo_root),
-                env=os.environ.copy(),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+        broker_result = self._answer_realtime_memory_query_sync(query, context=context)
+        broker_route = str(broker_result.get("route") or "unknown")
+        if broker_result.get("success") and broker_result.get("body"):
+            body = str(broker_result.get("body") or "")
+            failed = False
+            retrieval_span.finish(
+                "memory_retrieval_done",
+                success=True,
+                route=broker_route,
+                broker=True,
+                body_chars=len(body),
             )
+        else:
+            retrieval_span.log("memory_retrieval_cli_fallback", route=broker_route)
             try:
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                failed = True
-                body = f"Memory lookup timed out after {int(timeout)} seconds."
-                retrieval_span.finish("memory_retrieval_done", success=False, timed_out=True, exit_code="timeout")
-            else:
-                stdout = stdout_b.decode(errors="replace").strip()
-                stderr = stderr_b.decode(errors="replace").strip()
-                failed = proc.returncode != 0
-                body = stdout or stderr or "Memory lookup returned no output."
-                retrieval_span.finish(
-                    "memory_retrieval_done",
-                    success=not failed,
-                    exit_code=proc.returncode,
-                    stdout_chars=len(stdout),
-                    stderr_chars=len(stderr),
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    cwd=str(repo_root),
+                    env=os.environ.copy(),
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
                 )
-        except Exception as exc:
-            failed = True
-            body = f"Memory lookup failed: {exc}"
-            retrieval_span.finish("memory_retrieval_done", success=False, error_type=type(exc).__name__)
+                try:
+                    stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    failed = True
+                    body = f"Memory lookup timed out after {int(timeout)} seconds."
+                    retrieval_span.finish("memory_retrieval_done", success=False, timed_out=True, exit_code="timeout", route="cli_fallback")
+                else:
+                    stdout = stdout_b.decode(errors="replace").strip()
+                    stderr = stderr_b.decode(errors="replace").strip()
+                    failed = proc.returncode != 0
+                    body = stdout or stderr or "Memory lookup returned no output."
+                    retrieval_span.finish(
+                        "memory_retrieval_done",
+                        success=not failed,
+                        exit_code=proc.returncode,
+                        stdout_chars=len(stdout),
+                        stderr_chars=len(stderr),
+                        route="cli_fallback",
+                    )
+            except Exception as exc:
+                failed = True
+                body = f"Memory lookup failed: {exc}"
+                retrieval_span.finish("memory_retrieval_done", success=False, error_type=type(exc).__name__, route="cli_fallback")
         synthesis_span = _RealtimeLatencySpan("memory_synthesis", guild_id=guild_id, user_id=user_id, query_id=query_id)
         safe_body = body.replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
         synthesis_span.finish("memory_synthesis_done", failed=failed, body_chars=len(body), safe_chars=len(safe_body))
