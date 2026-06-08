@@ -1,5 +1,6 @@
 """Tests for the /voice command and auto voice reply in the gateway."""
 
+import importlib
 import importlib.util
 import json
 import os
@@ -683,6 +684,46 @@ class TestVoiceReceiver:
         receiver = self._make_receiver()
         assert receiver.check_silence() == []
 
+    def test_realtime_turn_detection_defaults_are_low_latency_and_noise_gated(self, monkeypatch):
+        import plugins.platforms.discord.adapter as discord_adapter
+
+        with monkeypatch.context() as m:
+            m.delenv("HERMES_REALTIME_SILENCE_SECONDS", raising=False)
+            m.delenv("HERMES_REALTIME_MIN_SPEECH_SECONDS", raising=False)
+            m.delenv("HERMES_REALTIME_MIN_RMS", raising=False)
+            reloaded = importlib.reload(discord_adapter)
+            assert 0.55 <= reloaded.VoiceReceiver.SILENCE_THRESHOLD <= 0.75
+            assert 0.35 <= reloaded.VoiceReceiver.MIN_SPEECH_DURATION <= 0.50
+            assert reloaded.VoiceReceiver.MIN_RMS >= 180
+
+        importlib.reload(discord_adapter)
+
+    def test_realtime_turn_detection_env_overrides(self, monkeypatch):
+        import plugins.platforms.discord.adapter as discord_adapter
+
+        with monkeypatch.context() as m:
+            m.setenv("HERMES_REALTIME_SILENCE_SECONDS", "0.72")
+            m.setenv("HERMES_REALTIME_MIN_SPEECH_SECONDS", "0.40")
+            reloaded = importlib.reload(discord_adapter)
+            assert reloaded.VoiceReceiver.SILENCE_THRESHOLD == 0.72
+            assert reloaded.VoiceReceiver.MIN_SPEECH_DURATION == 0.40
+
+        importlib.reload(discord_adapter)
+
+    def test_realtime_turn_detection_env_nonfinite_values_fall_back(self, monkeypatch):
+        import plugins.platforms.discord.adapter as discord_adapter
+
+        with monkeypatch.context() as m:
+            m.setenv("HERMES_REALTIME_SILENCE_SECONDS", "nan")
+            m.setenv("HERMES_REALTIME_MIN_SPEECH_SECONDS", "inf")
+            m.setenv("HERMES_REALTIME_MIN_RMS", "nan")
+            reloaded = importlib.reload(discord_adapter)
+            assert reloaded.VoiceReceiver.SILENCE_THRESHOLD == 0.65
+            assert reloaded.VoiceReceiver.MIN_SPEECH_DURATION == 0.45
+            assert reloaded.VoiceReceiver.MIN_RMS == 180
+
+        importlib.reload(discord_adapter)
+
     def test_check_silence_returns_completed_utterance(self):
         receiver = self._make_receiver()
         receiver.map_ssrc(100, 42)
@@ -708,6 +749,17 @@ class TestVoiceReceiver:
         receiver._last_packet_time[100] = time.monotonic() - 3.0
         completed = receiver.check_silence()
         assert len(completed) == 0
+
+    def test_check_silence_ignores_quiet_buffer(self):
+        receiver = self._make_receiver()
+        receiver.map_ssrc(100, 42)
+        # Long enough to be speech, but below the realtime RMS noise gate.
+        receiver._buffers[100] = bytearray(b"\x01\x00" * 96000)
+        receiver._last_packet_time[100] = time.monotonic() - 3.0
+        completed = receiver.check_silence()
+        assert completed == []
+        assert len(receiver._buffers[100]) == 0
+        assert 100 not in receiver._last_packet_time
 
     def test_check_silence_ignores_recent_audio(self):
         receiver = self._make_receiver()

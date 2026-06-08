@@ -14,6 +14,7 @@ import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import struct
@@ -353,6 +354,31 @@ def _discord_ready_timeout_seconds() -> float:
     return 30.0
 
 
+def _env_float(name: str, default: float, *, minimum: Optional[float] = None) -> float:
+    """Read a non-negative-ish realtime tuning value without import-time crashes."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using default %.2f", name, raw, default)
+        return default
+    if not math.isfinite(value):
+        logger.warning("Ignoring non-finite %s=%r; using default %.2f", name, raw, default)
+        return default
+    if minimum is not None and value < minimum:
+        logger.warning(
+            "Ignoring %s=%r below minimum %.2f; using default %.2f",
+            name,
+            raw,
+            minimum,
+            default,
+        )
+        return default
+    return value
+
+
 class VoiceReceiver:
     """Captures and decodes voice audio from a Discord voice channel.
 
@@ -362,9 +388,15 @@ class VoiceReceiver:
     completed utterances via a callback.
     """
 
-    SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance
-    MIN_SPEECH_DURATION = float(os.getenv("HERMES_REALTIME_MIN_SPEECH_SECONDS", "0.9"))  # skip short noise bursts
-    MIN_RMS = int(os.getenv("HERMES_REALTIME_MIN_RMS", "180"))  # skip quiet background noise
+    # Realtime turn-detection knobs. Defaults favor low dead air for Discord
+    # /voice realtime while keeping both duration and RMS gates to avoid room
+    # noise. Tune per deployment with:
+    #   HERMES_REALTIME_SILENCE_SECONDS    seconds of silence before commit
+    #   HERMES_REALTIME_MIN_SPEECH_SECONDS minimum buffer duration to accept
+    #   HERMES_REALTIME_MIN_RMS            RMS floor for background-noise reject
+    SILENCE_THRESHOLD = _env_float("HERMES_REALTIME_SILENCE_SECONDS", 0.65, minimum=0.2)
+    MIN_SPEECH_DURATION = _env_float("HERMES_REALTIME_MIN_SPEECH_SECONDS", 0.45, minimum=0.1)
+    MIN_RMS = int(_env_float("HERMES_REALTIME_MIN_RMS", 180.0, minimum=0.0))
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
 
