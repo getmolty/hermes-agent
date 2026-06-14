@@ -36,6 +36,31 @@ def _make_provider(slug, name=None, models=None, *, is_current=False,
     return entry
 
 
+def test_whitelist_fast_path_does_not_discover_all_providers(monkeypatch):
+    """A configured whitelist should build the picker directly with no network/discovery."""
+    monkeypatch.setattr(model_switch, "list_authenticated_providers",
+                        lambda **kw: pytest.fail("should not discover all providers"))
+    monkeypatch.setattr("hermes_cli.models.fetch_openrouter_models",
+                        lambda *a, **kw: pytest.fail("should not live-fetch OpenRouter"))
+
+    result = model_switch.list_picker_providers(
+        current_provider="zai",
+        current_model="glm-5.2",
+        max_models=50,
+        whitelist=[
+            {"provider": "openai-codex", "model": "*"},
+            {"provider": "zai", "model": "glm-5.2"},
+            {"provider": "openrouter", "model": "moonshotai/kimi-k2.6"},
+            {"provider": "openrouter", "model": "z-ai/glm-5.2"},
+        ],
+    )
+
+    assert [p["slug"] for p in result] == ["openai-codex", "zai", "openrouter"]
+    assert result[1]["models"] == ["glm-5.2"]
+    assert result[2]["models"] == ["moonshotai/kimi-k2.6", "z-ai/glm-5.2"]
+    assert all(p["source"] == "whitelist" for p in result)
+
+
 def test_openrouter_models_replaced_with_live_catalog(monkeypatch):
     """OpenRouter row's ``models`` should come from fetch_openrouter_models."""
     base = [

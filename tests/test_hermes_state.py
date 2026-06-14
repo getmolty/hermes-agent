@@ -94,6 +94,40 @@ class TestSessionLifecycle:
         assert session["model"] == "test-model"
         assert session["ended_at"] is None
 
+    def test_update_session_runtime_overwrites_model_config_and_billing(self, db):
+        db.create_session(
+            session_id="s-runtime",
+            source="gateway",
+            model="gpt-5.5",
+            model_config={"provider": "openai-codex"},
+        )
+        db.update_token_counts(
+            "s-runtime",
+            model="gpt-5.5",
+            billing_provider="openai-codex",
+            billing_base_url="https://chatgpt.com/backend-api/codex",
+            billing_mode="subscription_included",
+        )
+
+        db.update_session_runtime(
+            "s-runtime",
+            '{"model":"glm-5.2","provider":"zai","base_url":"https://api.z.ai/api/coding/paas/v4","api_mode":"chat_completions"}',
+            "glm-5.2",
+            billing_provider="zai",
+            billing_base_url="https://api.z.ai/api/coding/paas/v4",
+            billing_mode="unknown",
+        )
+
+        session = db.get_session("s-runtime")
+        assert session is not None
+        assert session["model"] == "glm-5.2"
+        assert session["model_config"] == (
+            '{"model":"glm-5.2","provider":"zai","base_url":"https://api.z.ai/api/coding/paas/v4","api_mode":"chat_completions"}'
+        )
+        assert session["billing_provider"] == "zai"
+        assert session["billing_base_url"] == "https://api.z.ai/api/coding/paas/v4"
+        assert session["billing_mode"] == "unknown"
+
 
     def test_get_nonexistent_session(self, db):
         assert db.get_session("nonexistent") is None

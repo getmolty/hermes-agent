@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -88,6 +89,110 @@ class GatewaySlashCommandsMixin:
     """In-session slash-command handlers for GatewayRunner."""
 
     async_session_store: AsyncSessionStore
+
+    def _session_model_override_from_switch_result(self, result: Any) -> dict:
+        """Return the in-memory session override payload for a /model result.
+
+        This payload may include ``api_key`` because it lives only in process
+        memory. The durable DB payload written below deliberately omits secrets.
+        """
+        return {
+            "model": result.new_model,
+            "provider": result.target_provider,
+            "api_key": result.api_key,
+            "base_url": result.base_url,
+            "api_mode": result.api_mode,
+        }
+
+    def _persist_session_model_runtime_override(
+        self,
+        source: SessionSource,
+        result: Any,
+    ) -> None:
+        """Persist a /model switch's runtime route for gateway restart resume.
+
+        The old messaging-gateway path only wrote ``sessions.model`` and kept
+        provider/base_url/api_mode in ``_session_model_overrides``. That meant a
+        gateway restart lost the real route and resumed the chat on the global
+        default model/provider. Store the non-secret runtime bundle in
+        ``model_config`` so a new GatewayRunner can restore the same session
+        override. API keys are intentionally resolved fresh at runtime.
+        """
+        sess_db = getattr(self, "_session_db", None)
+        if sess_db is None:
+            return
+        try:
+            sess_entry = self.session_store.get_or_create_session(source)
+            # If this session was auto-reset, consume the flag so the next
+            # regular message cleanup does not wipe the model override stored
+            # below (Closes #48031).
+            if getattr(sess_entry, "was_auto_reset", False):
+                sess_entry.was_auto_reset = False
+            row = sess_db.get_session(sess_entry.session_id) or {}
+            raw_config = row.get("model_config")
+            model_config: dict[str, Any] = {}
+            if isinstance(raw_config, dict):
+                model_config = dict(raw_config)
+            elif isinstance(raw_config, str) and raw_config.strip():
+                try:
+                    parsed = json.loads(raw_config)
+                    if isinstance(parsed, dict):
+                        model_config = parsed
+                except Exception:
+                    logger.debug(
+                        "Failed to parse existing session model_config before model switch",
+                        exc_info=True,
+                    )
+
+            # Preserve unrelated session metadata (reasoning_config,
+            # max_iterations, branch markers, etc.) while overwriting the active
+            # runtime route. Never persist api_key.
+            model_config.update(
+                {
+                    "model": result.new_model,
+                    "provider": result.target_provider,
+                    "base_url": result.base_url or "",
+                    "api_mode": result.api_mode or "",
+                }
+            )
+            model_config.pop("api_key", None)
+            model_config_json = json.dumps(model_config, sort_keys=True)
+
+            billing_provider = result.target_provider or None
+            billing_base_url = result.base_url or None
+            billing_mode = None
+            try:
+                from agent.usage_pricing import resolve_billing_route
+
+                route = resolve_billing_route(
+                    result.new_model,
+                    provider=result.target_provider,
+                    base_url=result.base_url,
+                )
+                billing_provider = route.provider or billing_provider
+                billing_base_url = route.base_url or billing_base_url
+                billing_mode = route.billing_mode or None
+            except Exception:
+                logger.debug("Failed to resolve billing route for model switch", exc_info=True)
+
+            if hasattr(sess_db, "update_session_runtime"):
+                sess_db.update_session_runtime(
+                    sess_entry.session_id,
+                    model_config_json,
+                    result.new_model,
+                    billing_provider=billing_provider,
+                    billing_base_url=billing_base_url,
+                    billing_mode=billing_mode,
+                )
+            else:
+                # Compatibility for narrow test doubles / older state stores.
+                sess_db.update_session_meta(
+                    sess_entry.session_id,
+                    model_config_json,
+                    result.new_model,
+                )
+        except Exception as exc:
+            logger.debug("Failed to persist model switch runtime to DB: %s", exc)
 
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
@@ -1504,13 +1609,10 @@ class GatewaySlashCommandsMixin:
                         custom_providers=custom_provs,
                         max_models=50,
                         include_moa=True,
+                        whitelist=model_whitelist or None,
                     )
                 except Exception:
                     providers = []
-
-                if model_whitelist and providers:
-                    from hermes_cli.model_switch import filter_providers_by_whitelist
-                    providers = filter_providers_by_whitelist(providers, model_whitelist)
 
                 if providers:
                     # Build a callback closure for when the user picks a model.
@@ -1601,21 +1703,9 @@ class GatewaySlashCommandsMixin:
                                     ),
                                 )
 
-                        # Persist the new model to the session DB so the
-                        # dashboard shows the updated model (#34850).
-                        _sess_db = getattr(_self, "_session_db", None)
-                        if _sess_db is not None:
-                            try:
-                                _sess_entry = await _self.async_session_store.get_or_create_session(
-                                    event.source
-                                )
-                                await _sess_db.update_session_model(
-                                    _sess_entry.session_id, result.new_model
-                                )
-                            except Exception as exc:
-                                logger.debug(
-                                    "Failed to persist model switch to DB: %s", exc
-                                )
+                        # Persist the full non-secret runtime route so gateway
+                        # restart/auto-resume keeps the selected provider/model.
+                        _self._persist_session_model_runtime_override(event.source, result)
 
                         # Store model note + session override
                         if not hasattr(_self, "_pending_model_notes"):
@@ -1625,13 +1715,9 @@ class GatewaySlashCommandsMixin:
                             f"via {result.provider_label or result.target_provider}. "
                             f"Adjust your self-identification accordingly.]"
                         )
-                        _self._session_model_overrides[_session_key] = {
-                            "model": result.new_model,
-                            "provider": result.target_provider,
-                            "api_key": result.api_key,
-                            "base_url": result.base_url,
-                            "api_mode": result.api_mode,
-                        }
+                        _self._session_model_overrides[_session_key] = (
+                            _self._session_model_override_from_switch_result(result)
+                        )
 
                         # Write-through the non-secret parts to the session
                         # store so the picked model survives a gateway restart
@@ -1847,24 +1933,10 @@ class GatewaySlashCommandsMixin:
                         ),
                     )
 
-            # Persist the new model to the session DB so the dashboard
-            # shows the updated model (#34850).
-            _sess_db = getattr(self, "_session_db", None)
-            if _sess_db is not None:
-                try:
-                    _sess_entry = await self.async_session_store.get_or_create_session(source)
-                    # If this session was auto-reset, consume the flag so the
-                    # next regular message's cleanup does not wipe the model
-                    # override just stored below (Closes #48031).
-                    if getattr(_sess_entry, "was_auto_reset", False):
-                        _sess_entry.was_auto_reset = False
-                    await _sess_db.update_session_model(
-                        _sess_entry.session_id, result.new_model
-                    )
-                except Exception as exc:
-                    logger.debug(
-                        "Failed to persist model switch to DB: %s", exc
-                    )
+            # Persist the full non-secret runtime route so gateway
+            # restart/auto-resume keeps the selected provider/model. This also
+            # updates the session model row for dashboard visibility.
+            self._persist_session_model_runtime_override(source, result)
 
             # Store a note to prepend to the next user message so the model
             # knows about the switch (avoids system messages mid-history).
@@ -1877,13 +1949,9 @@ class GatewaySlashCommandsMixin:
             )
 
             # Store session override so next agent creation uses the new model
-            self._session_model_overrides[session_key] = {
-                "model": result.new_model,
-                "provider": result.target_provider,
-                "api_key": result.api_key,
-                "base_url": result.base_url,
-                "api_mode": result.api_mode,
-            }
+            self._session_model_overrides[session_key] = (
+                self._session_model_override_from_switch_result(result)
+            )
 
             # Write-through the non-secret parts (model/provider/base_url) to
             # the session store so the override survives a gateway restart.

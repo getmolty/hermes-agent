@@ -7,6 +7,7 @@ from hermes_cli.models import (
     OPENROUTER_MODELS, fetch_openrouter_models, model_ids, detect_provider_for_model,
     is_nous_free_tier, partition_nous_models_by_tier,
     check_nous_free_tier, _FREE_TIER_CACHE_TTL,
+    provider_model_ids, validate_requested_model,
     union_with_portal_free_recommendations,
     union_with_portal_paid_recommendations,
 )
@@ -55,6 +56,32 @@ class TestOpenRouterModels:
             mid, desc = entry
             assert isinstance(mid, str) and len(mid) > 0
             assert isinstance(desc, str)
+
+    def test_glm_52_is_in_static_snapshot(self):
+        ids = [mid for mid, _ in OPENROUTER_MODELS]
+        assert "z-ai/glm-5.2" in ids
+        assert ids.index("z-ai/glm-5.2") < ids.index("z-ai/glm-5.1")
+
+
+class TestZAIModels:
+    def test_glm_52_is_native_zai_picker_frontier_even_when_models_dev_lags(self):
+        with patch("agent.models_dev.list_agentic_models", return_value=["glm-5.1", "glm-5"]):
+            ids = provider_model_ids("zai")
+        assert ids[0] == "glm-5.2"
+        assert "glm-5.1" in ids
+
+    def test_glm_52_validates_when_zai_models_endpoint_lags(self):
+        with patch("hermes_cli.models.fetch_api_models", return_value=["glm-5.1", "glm-5", "glm-4.7"]):
+            result = validate_requested_model(
+                "glm-5.2",
+                "zai",
+                api_key="test-key",
+                base_url="https://api.z.ai/api/coding/paas/v4",
+            )
+        assert result["accepted"] is True
+        assert result["persist"] is True
+        assert result["recognized"] is True
+        assert "curated zai catalog" in result["message"]
 
 
 class TestFetchOpenRouterModels:

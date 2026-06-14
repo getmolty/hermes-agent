@@ -118,7 +118,7 @@
         },
         {
           "id": "z-ai/glm-5.2",
-          "description": ""
+          "description": "recommended fallback"
         },
         {
           "id": "z-ai/glm-5.1",

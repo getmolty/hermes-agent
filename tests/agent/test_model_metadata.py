@@ -174,6 +174,9 @@ class TestEstimateRequestTokensRough:
 # =========================================================================
 
 class TestDefaultContextLengths:
+    def test_glm_52_default_context_is_1m(self):
+        assert DEFAULT_CONTEXT_LENGTHS["glm-5.2"] == 1000000
+
     def test_grok_substring_matching(self):
         # Longest-first substring matching must resolve the real xAI model
         # IDs to the correct fallback entries without 128k probe-down.

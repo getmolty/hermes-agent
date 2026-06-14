@@ -1862,7 +1862,12 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
 _AGENT_PENDING_SENTINEL = object()
 
 
-def _resolve_runtime_agent_kwargs() -> dict:
+def _resolve_runtime_agent_kwargs(
+    *,
+    requested_provider: Optional[str] = None,
+    explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
+) -> dict:
     """Resolve provider credentials for gateway-created AIAgent instances.
 
     Provider is read from ``config.yaml`` ``model.provider`` (the single
@@ -1883,8 +1888,18 @@ def _resolve_runtime_agent_kwargs() -> dict:
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
     try:
-        runtime = resolve_runtime_provider()
+        runtime = resolve_runtime_provider(
+            requested=requested_provider,
+            explicit_base_url=explicit_base_url,
+            target_model=target_model,
+        )
     except AuthError as auth_exc:
+        if requested_provider:
+            # Session-scoped /model overrides are explicit runtime choices. If
+            # their provider credentials fail, do not silently fall back to the
+            # global default model/provider; surface the auth error instead so
+            # the next turn cannot run on the wrong route after a restart.
+            raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
         # Distinguish a transient rate-limit/quota cap (credentials are fine,
         # re-auth cannot help) from a genuine auth failure (expired/revoked
         # token). Both fall through to the fallback chain, but the log message
@@ -3777,6 +3792,78 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return source
         return dataclasses.replace(source, thread_id=recovered)
 
+    def _restore_session_model_override_from_db(self, session_key: str) -> Optional[dict]:
+        """Restore a durable gateway /model runtime override for a session key.
+
+        Messaging gateway /model switches are session-scoped, not merely
+        process-scoped. On gateway restart the in-memory
+        ``_session_model_overrides`` dict is empty, so recover the non-secret
+        model/provider/base_url/api_mode bundle persisted in SQLite
+        ``sessions.model_config``. API keys are intentionally resolved fresh
+        later via the provider/auth stack.
+        """
+        if not session_key:
+            return None
+        existing = self._session_model_overrides.get(session_key)
+        if existing:
+            return existing
+        sess_db = getattr(self, "_session_db", None)
+        session_store = getattr(self, "session_store", None)
+        if sess_db is None or session_store is None:
+            return None
+        try:
+            entry = getattr(session_store, "_entries", {}).get(session_key)
+        except Exception:
+            entry = None
+        if entry is None or not getattr(entry, "session_id", None):
+            return None
+        try:
+            row = sess_db.get_session(entry.session_id) or {}
+        except Exception:
+            logger.debug("Failed to load session row for model override restore", exc_info=True)
+            return None
+
+        raw_config = row.get("model_config")
+        model_config: dict[str, Any] = {}
+        if isinstance(raw_config, dict):
+            model_config = dict(raw_config)
+        elif isinstance(raw_config, str) and raw_config.strip():
+            try:
+                parsed = json.loads(raw_config)
+                if isinstance(parsed, dict):
+                    model_config = parsed
+            except Exception:
+                logger.debug("Failed to parse stored session model_config", exc_info=True)
+                return None
+
+        model = str(model_config.get("model") or row.get("model") or "").strip()
+        provider = str(model_config.get("provider") or "").strip()
+        base_url = str(model_config.get("base_url") or "").strip()
+        api_mode = str(model_config.get("api_mode") or "").strip()
+        if not model or not (provider or base_url or api_mode):
+            return None
+
+        override: dict[str, Any] = {"model": model}
+        if provider:
+            override["provider"] = provider
+        if base_url:
+            override["base_url"] = base_url
+        if api_mode:
+            override["api_mode"] = api_mode
+        if "max_tokens" in model_config and model_config.get("max_tokens") is not None:
+            override["max_tokens"] = model_config.get("max_tokens")
+
+        self._session_model_overrides[session_key] = override
+        logger.info(
+            "Restored session model override from DB: session=%s model=%s provider=%s base_url=%s api_mode=%s",
+            session_key,
+            model,
+            provider,
+            base_url,
+            api_mode,
+        )
+        return override
+
     def _resolve_session_agent_runtime(
         self,
         *,
@@ -3801,6 +3888,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if resolved_session_key:
             self._rehydrate_session_model_override(resolved_session_key)
         override = self._session_model_overrides.get(resolved_session_key) if resolved_session_key else None
+        if not override and resolved_session_key:
+            override = self._restore_session_model_override_from_db(resolved_session_key)
         if override:
             override_model = override.get("model", model)
             override_runtime = {
@@ -3822,12 +3911,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     override_runtime.get("provider"),
                 )
                 return override_model, override_runtime
-            # Override exists but has no api_key — fall through to env-based
-            # resolution and apply model/provider from the override on top.
+            # Override exists but has no api_key (typical after gateway restart).
+            # Resolve credentials for the override's provider, not the global
+            # default, then apply the stored model/base_url/api_mode on top.
             logger.debug(
-                "Session model override (no api_key, fallback): session=%s config_model=%s override_model=%s",
-                resolved_session_key or "", model, override_model,
+                "Session model override (credential restore): session=%s config_model=%s override_model=%s provider=%s",
+                resolved_session_key or "",
+                model,
+                override_model,
+                override_runtime.get("provider"),
             )
+            runtime_kwargs = _resolve_runtime_agent_kwargs(
+                requested_provider=override_runtime.get("provider"),
+                explicit_base_url=override_runtime.get("base_url"),
+                target_model=override_model,
+            )
+            model = override_model
+            if resolved_session_key:
+                model, runtime_kwargs = self._apply_session_model_override(
+                    resolved_session_key, model, runtime_kwargs
+                )
+            return model, runtime_kwargs
         else:
             logger.debug(
                 "No session model override: session=%s config_model=%s override_keys=%s",
@@ -16219,7 +16323,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not override:
             return model, runtime_kwargs
         model = override.get("model", model)
-        for key in ("provider", "api_key", "base_url", "api_mode", "credential_pool"):
+        for key in ("provider", "api_key", "base_url", "api_mode", "max_tokens", "credential_pool"):
             val = override.get(key)
             if val is not None:
                 runtime_kwargs[key] = val

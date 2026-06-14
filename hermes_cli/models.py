@@ -74,7 +74,7 @@ OPENROUTER_MODELS: list[tuple[str, str]] = [
     # MiniMax
     ("minimax/minimax-m3",                     ""),
     # Z-AI
-    ("z-ai/glm-5.2",                           ""),
+    ("z-ai/glm-5.2",                           "recommended fallback"),
     ("z-ai/glm-5.1",                           ""),
     # Xiaomi
     ("xiaomi/mimo-v2.5-pro",                   ""),
@@ -270,6 +270,7 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     ],
     "openai-codex": _codex_curated_models(),
     "openrouter": [
+        "z-ai/glm-5.2",
         "moonshotai/kimi-k2.6",
         "deepseek/deepseek-v4-pro",
         "deepseek/deepseek-v4-flash",
@@ -2319,6 +2320,13 @@ def _merge_with_models_dev(provider: str, curated: list[str]) -> list[str]:
             continue
         seen_lower.add(key)
         merged.append(mid)
+
+    # Z.AI's /models and models.dev catalogs can lag devpack releases. Keep the
+    # Hermes-curated coding-plan frontier at the top even when the live catalog
+    # still reports glm-5.1 first.
+    if provider == "zai" and "glm-5.2" in {str(m).lower() for m in merged}:
+        merged = [m for m in merged if str(m).lower() != "glm-5.2"]
+        merged.insert(0, "glm-5.2")
     return merged
 
 
@@ -2552,9 +2560,10 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                         merged = list(primary)
                         merged_lower = {m.lower() for m in primary}
                         for m in secondary:
-                            if m.lower() not in merged_lower:
+                            key = m.lower()
+                            if key not in merged_lower:
                                 merged.append(m)
-                                merged_lower.add(m.lower())
+                                merged_lower.add(key)
                         return merged
                     return live
             # Use profile's fallback_models if defined
@@ -4434,10 +4443,32 @@ def validate_requested_model(
                 "message": None,
             }
         else:
-            # API responded but model is not listed.  Accept anyway —
-            # the user may have access to models not shown in the public
-            # listing (e.g. Z.AI Pro/Max plans can use glm-5 on coding
-            # endpoints even though it's not in /models).  Warn but allow.
+            # API responded but model is not listed. Some providers expose newly
+            # callable coding-plan / early-access models before `/models` catches
+            # up (Z.AI GLM-5.2 did exactly this). If Hermes' curated catalog knows
+            # the ID, accept it instead of blocking a valid switch.
+            try:
+                catalog_models = provider_model_ids(normalized)
+            except Exception:
+                catalog_models = []
+            catalog_lower = {str(m).lower(): m for m in catalog_models}
+            catalog_match = catalog_lower.get(requested_for_lookup.lower())
+            if catalog_match:
+                suggestions = get_close_matches(requested, api_models, n=3, cutoff=0.5)
+                suggestion_text = ""
+                if suggestions:
+                    suggestion_text = "\n  Similar listed models: " + ", ".join(f"`{s}`" for s in suggestions)
+                return {
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": True,
+                    "message": (
+                        f"Note: `{requested}` is in Hermes' curated {normalized} catalog "
+                        f"but was not returned by this provider's `/models` listing. "
+                        "Accepting it because provider model listings can lag newly released or gated models."
+                        f"{suggestion_text}"
+                    ),
+                }
 
             # Auto-correct if the top match is very similar (e.g. typo)
             auto = get_close_matches(requested_for_lookup, api_models, n=1, cutoff=0.9)

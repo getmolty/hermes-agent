@@ -2542,6 +2542,43 @@ class SessionDB:
             )
         self._execute_write(_do)
 
+    def update_session_runtime(
+        self,
+        session_id: str,
+        model_config_json: str,
+        model: Optional[str] = None,
+        *,
+        billing_provider: Optional[str] = None,
+        billing_base_url: Optional[str] = None,
+        billing_mode: Optional[str] = None,
+    ) -> None:
+        """Persist the active model runtime bundle for a session.
+
+        Unlike token-count updates, this intentionally overwrites the billing
+        route columns. A mid-session `/model` switch changes which provider/base
+        URL subsequent API calls use; leaving the old route in place makes
+        resumed gateway sessions restore misleading/stale runtime metadata.
+        """
+        def _do(conn):
+            conn.execute(
+                """UPDATE sessions
+                   SET model_config = ?,
+                       model = COALESCE(?, model),
+                       billing_provider = ?,
+                       billing_base_url = ?,
+                       billing_mode = ?
+                   WHERE id = ?""",
+                (
+                    model_config_json,
+                    model,
+                    billing_provider,
+                    billing_base_url,
+                    billing_mode,
+                    session_id,
+                ),
+            )
+        self._execute_write(_do)
+
     def update_system_prompt(self, session_id: str, system_prompt: str) -> None:
         """Store the full assembled system prompt snapshot."""
         def _do(conn):

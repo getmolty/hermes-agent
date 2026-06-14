@@ -641,7 +641,7 @@ def _resolve_api_key_provider_secret(
 # endpoints.  A key that works on one may return "Insufficient balance" on
 # another.  We probe at setup time and store the working endpoint.
 # Each entry lists candidate models to try in order — newer coding plan accounts
-# may only have access to recent models (glm-5.1, glm-5v-turbo) while older
+# may only have access to recent models (glm-5.2, glm-5.1, glm-5v-turbo) while older
 # ones still use glm-4.7.
 
 ZAI_ENDPOINTS = [

@@ -2435,6 +2435,85 @@ def _prepend_moa_picker_provider(providers: List[dict], current_provider: str = 
         return providers
 
 
+def build_whitelisted_picker(
+    whitelist: List[dict],
+    current_provider: str = "",
+    current_model: str = "",
+    max_models: int = 50,
+) -> List[dict]:
+    """Build a picker provider list **directly from a whitelist** — zero network calls.
+
+    When the user has ``model.whitelist`` in config.yaml, the interactive
+    ``/model`` picker should show only those curated entries instantly rather
+    than doing the full provider discovery + live ``/models`` probing that
+    :func:`list_authenticated_providers` performs.
+
+    For each whitelist entry:
+      - ``model: "*"`` → use the static curated catalog for that provider
+      - ``model: "specific-id"`` → show exactly that model ID
+
+    Provider display names come from :func:`get_label` (no network).
+    Provider rows are emitted in whitelist order so the picker reflects the
+    user's configured priority.
+    """
+    from hermes_cli.models import _PROVIDER_MODELS, OPENROUTER_MODELS
+    from hermes_cli.providers import get_label
+
+    seen: dict[str, list[str]] = {}
+    order: list[str] = []
+
+    for entry in whitelist:
+        if not isinstance(entry, dict):
+            continue
+        provider = str(entry.get("provider", "")).strip()
+        model = str(entry.get("model", "")).strip()
+        if not provider or not model:
+            continue
+        if provider not in seen:
+            seen[provider] = []
+            order.append(provider)
+        if model == "*":
+            seen[provider] = ["*"]
+        elif "*" not in seen[provider] and model not in seen[provider]:
+            seen[provider].append(model)
+
+    results: List[dict] = []
+    limit = max_models or 50
+    for slug in order:
+        models = seen[slug]
+        if "*" in models:
+            if slug == "openrouter":
+                static = [mid for mid, _ in OPENROUTER_MODELS]
+            else:
+                static = list(_PROVIDER_MODELS.get(slug, []))
+                if not static:
+                    try:
+                        from providers import get_provider_profile
+                        p = get_provider_profile(slug)
+                        if p and p.fallback_models:
+                            static = list(p.fallback_models)
+                    except Exception:
+                        pass
+            shown = static[:limit]
+        else:
+            shown = models[:limit]
+
+        if not shown:
+            continue
+
+        results.append({
+            "slug": slug,
+            "name": get_label(slug),
+            "is_current": slug == current_provider,
+            "is_user_defined": False,
+            "models": shown,
+            "total_models": len(shown),
+            "source": "whitelist",
+        })
+
+    return results
+
+
 def list_picker_providers(
     current_provider: str = "",
     current_base_url: str = "",
@@ -2443,6 +2522,7 @@ def list_picker_providers(
     max_models: int | None = None,
     current_model: str = "",
     include_moa: bool = False,
+    whitelist: List[dict] | None = None,
 ) -> List[dict]:
     """Interactive-picker variant of :func:`list_authenticated_providers`.
 
@@ -2462,7 +2542,20 @@ def list_picker_providers(
     All other providers and metadata fields are passed through unchanged.
     The typed ``/model <name>`` path is unaffected -- only the interactive
     picker payload is narrowed.
+
+    **Fast path:** when *whitelist* is provided (non-empty), returns
+    immediately via :func:`build_whitelisted_picker` with zero network
+    calls so the picker opens instantly for users who have curated
+    ``model.whitelist`` entries.
     """
+    if whitelist:
+        return build_whitelisted_picker(
+            whitelist,
+            current_provider=current_provider,
+            current_model=current_model,
+            max_models=max_models or 50,
+        )
+
     from hermes_cli.models import fetch_openrouter_models
 
     providers = list_authenticated_providers(
