@@ -1,0 +1,177 @@
+%PDF-1.4
+% Hermes Agent Discord OpenAI Realtime Voice Setup Guide
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R 6 0 R 9 0 R] /Count 3 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 2400 >>
+stream
+BT
+/F1 18 Tf
+72 740 Td
+(Hermes Agent + Discord + OpenAI Realtime Voice Setup) Tj
+/F1 10 Tf
+0 -28 Td
+(PDF version of the setup guide. Full Markdown source:) Tj
+0 -14 Td
+(website/docs/guides/hermes-discord-openai-realtime-voice-setup.md) Tj
+0 -28 Td
+(Goal: run Hermes as a Discord bot that can join a voice channel and use OpenAI Realtime speech-to-speech.) Tj
+0 -20 Td
+(Architecture:) Tj
+0 -14 Td
+(Discord RTP/Opus -> PCM -> OpenAI Realtime WebSocket -> Discord voice playback.) Tj
+0 -14 Td
+(For long work, Realtime calls a safe Hermes subagent handoff tool and posts durable output to the text channel.) Tj
+0 -28 Td
+(Prerequisites:) Tj
+0 -14 Td
+(1. Discord application and bot token from https://discord.com/developers/applications.) Tj
+0 -14 Td
+(2. OpenAI Platform API key from https://platform.openai.com/api-keys with Realtime access.) Tj
+0 -14 Td
+(3. Hermes Agent installed from package or source checkout.) Tj
+0 -14 Td
+(4. ffmpeg, Opus, Python voice dependencies, and a running Hermes gateway.) Tj
+0 -14 Td
+(5. Bot permissions: View Channels, Send Messages, Read History, Connect, Speak, Use Voice Activity.) Tj
+0 -28 Td
+(Install basics:) Tj
+0 -14 Td
+(macOS: brew install ffmpeg opus portaudio espeak-ng) Tj
+0 -14 Td
+(Ubuntu/Debian: sudo apt install ffmpeg libopus0 portaudio19-dev espeak-ng) Tj
+0 -14 Td
+(Python: python -m pip install -U "hermes-agent[messaging,voice]" "discord.py[voice]" "PyNaCl>=1.5.0" davey websockets) Tj
+ET
+endstream
+endobj
+6 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 7 0 R >>
+endobj
+7 0 obj
+<< /Length 2400 >>
+stream
+BT
+/F1 16 Tf
+72 740 Td
+(Configuration) Tj
+/F1 10 Tf
+0 -28 Td
+(Add secrets to ~/.hermes/.env. Never commit this file.) Tj
+0 -24 Td
+(DISCORD_BOT_TOKEN=your-discord-bot-token) Tj
+0 -14 Td
+(DISCORD_ALLOWED_USERS=your-discord-user-id) Tj
+0 -14 Td
+(OPENAI_REALTIME_API_KEY=sk-...) Tj
+0 -14 Td
+(OPENAI_REALTIME_MODEL=gpt-realtime) Tj
+0 -14 Td
+(OPENAI_REALTIME_VOICE=alloy) Tj
+0 -14 Td
+(OPENAI_REALTIME_INSTRUCTIONS=Respond in English only. Keep spoken replies concise. Use Hermes subagent handoff for long/tool work.) Tj
+0 -24 Td
+(Hermes checks Realtime keys in this order:) Tj
+0 -14 Td
+(1. OPENAI_REALTIME_API_KEY) Tj
+0 -14 Td
+(2. VOICE_TOOLS_OPENAI_KEY) Tj
+0 -14 Td
+(3. OPENAI_API_KEY) Tj
+0 -28 Td
+(Recommended ~/.hermes/config.yaml fallback settings:) Tj
+0 -14 Td
+(stt.provider: local) Tj
+0 -14 Td
+(tts.provider: edge) Tj
+0 -14 Td
+(voice.auto_tts: false) Tj
+0 -14 Td
+(discord.require_mention: true) Tj
+0 -14 Td
+(discord.auto_thread: true) Tj
+0 -28 Td
+(Discord Developer Portal:) Tj
+0 -14 Td
+(Enable Presence Intent, Server Members Intent, and Message Content Intent.) Tj
+0 -14 Td
+(Invite with scopes bot and applications.commands. Verify voice permissions in the actual target channel.) Tj
+ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 10 0 R >>
+endobj
+10 0 obj
+<< /Length 2400 >>
+stream
+BT
+/F1 16 Tf
+72 740 Td
+(Verification and Use) Tj
+/F1 10 Tf
+0 -28 Td
+(Verify layer-by-layer:) Tj
+0 -18 Td
+(1. Start gateway: hermes gateway) Tj
+0 -14 Td
+(2. Test text in Discord: /whoami or mention/DM the bot.) Tj
+0 -14 Td
+(3. Run from checkout: python scripts/discord-voice-doctor.py) Tj
+0 -14 Td
+(4. Run Realtime smokes if available:) Tj
+0 -14 Td
+(   python ~/.hermes/skills/devops/hermes-operations/scripts/openai_realtime_text_smoke.py) Tj
+0 -14 Td
+(   python ~/.hermes/skills/devops/hermes-operations/scripts/openai_realtime_audio_smoke.py) Tj
+0 -14 Td
+(5. Test Hermes-native voice first: /voice join, /voice status, /voice leave.) Tj
+0 -14 Td
+(6. Test Realtime voice: join a VC, then run /voice realtime in the linked text channel.) Tj
+0 -28 Td
+(Useful Discord commands:) Tj
+0 -14 Td
+(/voice realtime - join VC with OpenAI Realtime engine) Tj
+0 -14 Td
+(/voice join - join VC with Hermes-native STT/TTS engine) Tj
+0 -14 Td
+(/voice status - inspect state) Tj
+0 -14 Td
+(/voice off - switch live voice engine back/off) Tj
+0 -14 Td
+(/voice leave - disconnect and clear state) Tj
+0 -28 Td
+(PASS means text, slash commands, Discord voice transport, OpenAI Realtime smoke, /voice realtime audio, and subagent handoff are all verified.) Tj
+0 -14 Td
+(PARTIAL means only some layers are verified. BLOCKED means a required key, token, permission, dependency, network path, or tooling capability is missing.) Tj
+ET
+endstream
+endobj
+xref
+0 11
+0000000000 65535 f 
+0000000000 00000 n 
+0000000000 00000 n 
+0000000000 00000 n 
+0000000000 00000 n 
+0000000000 00000 n 
+0000000000 00000 n 
+0000000000 00000 n 
+0000000000 00000 f 
+0000000000 00000 n 
+0000000000 00000 n 
+trailer
+<< /Root 1 0 R /Size 11 >>
+startxref
+0
+%%EOF

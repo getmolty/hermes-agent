@@ -324,13 +324,28 @@ class HonchoMemoryProvider(MemoryProvider):
             # ----- B5: cost-awareness config -----
             try:
                 raw = cfg.raw or {}
-                self._injection_frequency = raw.get("injectionFrequency", "every-turn")
-                self._context_cadence = int(raw.get("contextCadence", 1))
-                # Backwards-compat: unset dialecticCadence falls back to 1
-                # (every turn) so existing honcho.json configs without the key
-                # behave as they did before. New setups via `hermes honcho setup`
-                # get dialecticCadence=2 written explicitly by the wizard.
-                self._dialectic_cadence = int(raw.get("dialecticCadence", 1))
+                host_block = {}
+                try:
+                    hosts = raw.get("hosts") or {}
+                    host_block = hosts.get(cfg.host) or {}
+                    # Accept the legacy profile-host form used by the config resolver.
+                    if not host_block and cfg.host.startswith("hermes_"):
+                        host_block = hosts.get(f"hermes.{cfg.host[len('hermes_'):]}") or {}
+                except Exception:
+                    host_block = {}
+
+                def _host_or_root(key: str, default=None):
+                    value = host_block.get(key, raw.get(key, default))
+                    return default if value is None else value
+
+                self._injection_frequency = _host_or_root("injectionFrequency", "every-turn")
+                self._context_cadence = int(_host_or_root("contextCadence", 1))
+                # 0 disables dialectic .chat() prewarm/prefetch entirely while
+                # keeping fast peer.context()/card injection and Honcho tools.
+                # This is useful for gateway latency and for deployments where
+                # backend dialectic synthesis is slower/less reliable than raw
+                # context/search.
+                self._dialectic_cadence = int(_host_or_root("dialecticCadence", 1))
                 self._dialectic_depth = max(1, min(cfg.dialectic_depth, 3))
                 self._dialectic_depth_levels = cfg.dialectic_depth_levels
                 self._reasoning_heuristic = cfg.reasoning_heuristic
@@ -504,13 +519,16 @@ class HonchoMemoryProvider(MemoryProvider):
                 else:
                     self._dialectic_empty_streak += 1
 
-            self._prefetch_thread_started_at = time.monotonic()
-            prewarm_thread = threading.Thread(
-                target=_prewarm_dialectic, daemon=True, name="honcho-prewarm-dialectic"
-            )
-            prewarm_thread.start()
-            self._prefetch_thread = prewarm_thread
-            logger.debug("Honcho pre-warm started for session: %s", self._session_key)
+            if self._dialectic_cadence <= 0:
+                logger.debug("Honcho dialectic pre-warm skipped: dialecticCadence=0")
+            else:
+                self._prefetch_thread_started_at = time.monotonic()
+                prewarm_thread = threading.Thread(
+                    target=_prewarm_dialectic, daemon=True, name="honcho-prewarm-dialectic"
+                )
+                prewarm_thread.start()
+                self._prefetch_thread = prewarm_thread
+                logger.debug("Honcho pre-warm started for session: %s", self._session_key)
 
         self._session_initialized = True
 
@@ -612,9 +630,12 @@ class HonchoMemoryProvider(MemoryProvider):
         elif self._recall_mode == "tools":
             header = (
                 "# Honcho Memory\n"
-                "Active (tools-only mode). Use honcho_profile for a quick factual snapshot, "
+                "Active (tools-only mode). For simple recall questions, project names, local directory/path lookups, or 'what was X' questions, "
+                "use the fast memory path first: honcho_search, honcho_context, and/or session_search. "
+                "Do not use filesystem, terminal, browser, or code-execution tools for those unless fast memory/session recall fails or the user asks to inspect live files. "
+                "Use honcho_profile for a quick factual snapshot, "
                 "honcho_search for raw excerpts, honcho_context for raw peer context, "
-                "honcho_reasoning for synthesized answers (pass reasoning_level "
+                "honcho_reasoning only when raw search/context is insufficient and synthesized reasoning is needed (pass reasoning_level "
                 "minimal/low/medium/high/max — you pick the depth per call), "
                 "honcho_conclude to save facts about the user. "
                 "No automatic context injection — you must use tools to access memory."
@@ -623,9 +644,12 @@ class HonchoMemoryProvider(MemoryProvider):
             header = (
                 "# Honcho Memory\n"
                 "Active (hybrid mode). Relevant context is auto-injected AND memory tools are available. "
+                "For simple recall questions, project names, local directory/path lookups, or 'what was X' questions, "
+                "use the fast memory path first: honcho_search, honcho_context, and/or session_search. "
+                "Do not use filesystem, terminal, browser, or code-execution tools for those unless fast memory/session recall fails or the user asks to inspect live files. "
                 "Use honcho_profile for a quick factual snapshot, "
                 "honcho_search for raw excerpts, honcho_context for raw peer context, "
-                "honcho_reasoning for synthesized answers (pass reasoning_level "
+                "honcho_reasoning only when raw search/context is insufficient and synthesized reasoning is needed (pass reasoning_level "
                 "minimal/low/medium/high/max — you pick the depth per call), "
                 "honcho_conclude to save facts about the user."
             )
@@ -693,6 +717,11 @@ class HonchoMemoryProvider(MemoryProvider):
             parts.append(base_context)
 
         # ----- Layer 2: Dialectic supplement -----
+        if self._dialectic_cadence <= 0:
+            if parts:
+                return self._truncate_to_budget("\n\n".join(parts))
+            return ""
+
         # On the very first turn, no queue_prefetch() has run yet so the
         # dialectic result is empty.  Run with a bounded timeout so a slow
         # Honcho connection doesn't block the first response indefinitely.
@@ -821,6 +850,10 @@ class HonchoMemoryProvider(MemoryProvider):
                 logger.debug("Honcho context prefetch failed: %s", e)
 
         # ----- Dialectic prefetch (supplement layer) -----
+        if self._dialectic_cadence <= 0:
+            logger.debug("Honcho dialectic prefetch skipped: dialecticCadence=0")
+            return
+
         # Thread-alive guard with stale-thread recovery: a hung Honcho call
         # older than timeout × multiplier is treated as dead so it can't
         # block subsequent fires.

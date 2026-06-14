@@ -1130,6 +1130,49 @@ class HonchoSessionManager:
             return ""
 
         try:
+            # Prefer Honcho's raw semantic search when the SDK client is already
+            # initialized.  Peer.context(search_query=...) returns synthesized
+            # representation/card text, which is useful for profile questions
+            # but too lossy for exact factual lookups like "what directory was
+            # the voice app in?"  Raw message hits preserve path strings and
+            # other concrete answers.
+            raw_parts: list[str] = []
+            honcho_client = self._honcho
+            if honcho_client is not None and hasattr(honcho_client, "search"):
+                try:
+                    limit = max(3, min(10, max_tokens // 120 if max_tokens else 5))
+                    hits = honcho_client.search(query, limit=limit) or []
+                    seen: set[str] = set()
+                    budget = max(500, max_tokens * 4)
+                    used = 0
+                    for hit in hits:
+                        content = (
+                            getattr(hit, "content", None)
+                            or (hit.get("content") if isinstance(hit, dict) else None)
+                            or ""
+                        ).strip()
+                        if not content or content in seen:
+                            continue
+                        seen.add(content)
+                        session_id = (
+                            getattr(hit, "session_id", None)
+                            or getattr(hit, "session_name", None)
+                            or (hit.get("session_id") if isinstance(hit, dict) else None)
+                            or (hit.get("session_name") if isinstance(hit, dict) else None)
+                            or ""
+                        )
+                        prefix = f"[{session_id}] " if session_id else ""
+                        excerpt = content.replace("\n", " ")[:800]
+                        line = f"- {prefix}{excerpt}"
+                        if used + len(line) > budget:
+                            break
+                        raw_parts.append(line)
+                        used += len(line)
+                    if raw_parts:
+                        return "## Raw message search results\n" + "\n".join(raw_parts)
+                except Exception as e:
+                    logger.debug("Honcho raw search failed: %s", e)
+
             observer_peer_id, target = self._resolve_observer_target(session, peer)
 
             ctx = self._fetch_peer_context(

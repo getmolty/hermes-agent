@@ -691,6 +691,7 @@ const sidebars: SidebarsConfig = {
         'guides/use-mcp-with-hermes',
         'guides/use-soul-with-hermes',
         'guides/use-voice-mode-with-hermes',
+        'guides/hermes-discord-openai-realtime-voice-setup',
         'guides/automate-with-cron',
         'guides/cron-script-only',
         'guides/automation-blueprints',

@@ -44,7 +44,7 @@ the mixer's output cannot echo back into transcription.
 
 import logging
 import threading
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 if TYPE_CHECKING:  # numpy is an optional ("voice" extra) dep — never import at runtime top-level
     import numpy as np
@@ -145,6 +145,135 @@ class MixerChild:
         return samples
 
 
+class BufferedPCMStream:
+    """Appendable speech child for low-latency streaming audio.
+
+    Realtime APIs emit small PCM deltas before the final response is complete.
+    ``MixerChild`` is intentionally immutable (one complete clip), so this
+    child keeps a thread-safe byte buffer that the asyncio loop appends to while
+    discord.py's sender thread drains 20 ms frames via :meth:`read_frame`.
+    """
+
+    __slots__ = (
+        "name", "_buffer", "_closed", "_finished", "_lock",
+        "gain", "is_speech", "fade_frames", "_fade_done",
+        "_on_first_frame", "_first_frame_sent", "_audio_frames_played",
+    )
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        gain: float = 1.0,
+        is_speech: bool = True,
+        fade_in_ms: int = 0,
+        on_first_frame: Optional[Callable[[int], None]] = None,
+    ):
+        self.name = name
+        self._buffer = bytearray()
+        self._closed = False
+        self._finished = False
+        self._lock = threading.Lock()
+        self.gain = float(gain)
+        self.is_speech = is_speech
+        self.fade_frames = max(0, fade_in_ms // FRAME_LENGTH_MS)
+        self._fade_done = 0
+        self._on_first_frame = on_first_frame
+        self._first_frame_sent = False
+        self._audio_frames_played = 0
+
+    @property
+    def finished(self) -> bool:
+        with self._lock:
+            return self._finished
+
+    @property
+    def played_ms(self) -> int:
+        """Milliseconds of real (non-keepalive) audio drained to Discord so far.
+
+        Barge-in uses this to tell the Realtime API exactly how much of the
+        reply the user actually heard (``conversation.item.truncate``).
+        """
+        with self._lock:
+            return self._audio_frames_played * FRAME_LENGTH_MS
+
+    @property
+    def buffered_bytes(self) -> int:
+        """Unplayed bytes still queued (0 == fully drained)."""
+        with self._lock:
+            return len(self._buffer)
+
+    def append(self, pcm: bytes) -> None:
+        if not pcm:
+            return
+        with self._lock:
+            if self._closed or self._finished:
+                return
+            self._buffer.extend(pcm)
+
+    def close(self) -> None:
+        with self._lock:
+            self._closed = True
+
+    def flush(self) -> None:
+        """Drop all unplayed audio immediately (user barge-in cut)."""
+        with self._lock:
+            self._buffer.clear()
+            self._closed = True
+            self._finished = True
+
+    def read_frame(self) -> "Optional[np.ndarray]":
+        """Return the next buffered frame, silence while open, or None when done."""
+        np = _require_numpy()
+        first_frame_callback: Optional[Callable[[int], None]] = None
+        first_frame_bytes = 0
+        frame_has_audio = False
+
+        with self._lock:
+            if self._finished:
+                return None
+            has_audio = False
+            if len(self._buffer) >= FRAME_SIZE:
+                chunk = bytes(self._buffer[:FRAME_SIZE])
+                del self._buffer[:FRAME_SIZE]
+                has_audio = True
+            elif self._closed:
+                if self._buffer:
+                    chunk = bytes(self._buffer) + b"\x00" * (FRAME_SIZE - len(self._buffer))
+                    self._buffer.clear()
+                    has_audio = True
+                else:
+                    self._finished = True
+                    return None
+            else:
+                # Keep the speech child alive while the Realtime API is still
+                # producing bytes. This preserves ducking without inventing
+                # audio; the frame contributes silence to the mix.
+                chunk = SILENCE_FRAME
+
+            if has_audio:
+                self._audio_frames_played += 1
+                if not self._first_frame_sent:
+                    self._first_frame_sent = True
+                    first_frame_callback = self._on_first_frame
+                    first_frame_bytes = len(chunk)
+            frame_has_audio = has_audio
+
+        samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+        gain = self.gain
+        if frame_has_audio and self.fade_frames and self._fade_done < self.fade_frames:
+            self._fade_done += 1
+            gain *= self._fade_done / self.fade_frames
+        if gain != 1.0:
+            samples = samples * gain
+        if first_frame_callback is not None:
+            try:
+                first_frame_callback(first_frame_bytes)
+            except Exception:
+                logger.debug("BufferedPCMStream first-frame callback failed", exc_info=True)
+        return samples
+
+
 class VoiceMixer:
     """A continuous ``discord.AudioSource`` that mixes N child streams.
 
@@ -168,7 +297,7 @@ class VoiceMixer:
     ):
         self._lock = threading.Lock()
         self._ambient: Optional[MixerChild] = None
-        self._speech: List[MixerChild] = []
+        self._speech: List[Any] = []
         self._ambient_gain = float(ambient_gain)
         self._duck_gain = float(duck_gain)
         self._speech_gain = float(speech_gain)
@@ -222,6 +351,30 @@ class VoiceMixer:
             if self._ambient is not None:
                 self._ambient.gain = self._duck_gain
 
+    def start_buffered_speech(
+        self,
+        *,
+        name: str = "speech_stream",
+        gain: Optional[float] = None,
+        fade_in_ms: int = 40,
+        on_first_frame: Optional[Callable[[int], None]] = None,
+    ) -> BufferedPCMStream:
+        """Start an appendable speech stream and return its buffer handle."""
+        with self._lock:
+            child = BufferedPCMStream(
+                name,
+                gain=self._speech_gain if gain is None else float(gain),
+                is_speech=True,
+                fade_in_ms=fade_in_ms,
+                on_first_frame=on_first_frame,
+            )
+            self._speech.append(child)
+            self._speech_active = True
+            self._duck_release_left = 0
+            if self._ambient is not None:
+                self._ambient.gain = self._duck_gain
+            return child
+
     @property
     def speech_active(self) -> bool:
         with self._lock:
@@ -230,6 +383,10 @@ class VoiceMixer:
     def stop_speech(self) -> None:
         """Drop any in-flight speech immediately and release the duck."""
         with self._lock:
+            for child in self._speech:
+                flush = getattr(child, "flush", None)
+                if callable(flush):
+                    flush()
             self._speech.clear()
             self._begin_duck_release_locked()
 
@@ -257,7 +414,7 @@ class VoiceMixer:
 
             # Speech children (drop exhausted ones; release duck when last ends)
             if self._speech:
-                still_live: List[MixerChild] = []
+                still_live: List[Any] = []
                 for child in self._speech:
                     frame = child.read_frame()
                     if frame is None:

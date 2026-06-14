@@ -247,6 +247,23 @@ class TestPeerLookupHelpers:
         assert result == ["Role: user"]
         assistant_peer.set_card.assert_called_once_with(["Role: user"], target=session.user_peer_id)
 
+    def test_search_context_returns_raw_semantic_hits_before_synthesized_context(self):
+        mgr, session = self._make_cached_manager()
+        hit = SimpleNamespace(
+            content="/Users/frank/projects/hermes-jarvis",
+            session_id="hermes-agent",
+        )
+        mgr._honcho = MagicMock()
+        mgr._honcho.search.return_value = [hit]
+        mgr._get_or_create_peer = MagicMock()
+
+        result = mgr.search_context(session.key, "voice app directory")
+
+        assert "## Raw message search results" in result
+        assert "/Users/frank/projects/hermes-jarvis" in result
+        mgr._honcho.search.assert_called_once_with("voice app directory", limit=6)
+        mgr._get_or_create_peer.assert_not_called()
+
     def test_search_context_uses_assistant_perspective_with_target(self):
         mgr, session = self._make_cached_manager()
         assistant_peer = MagicMock()

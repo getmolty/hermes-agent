@@ -355,3 +355,43 @@ def test_honcho_tools_lazy_hooks_do_not_prestart_background_init(monkeypatch):
     assert result == {"result": ["ready"]}
     assert init_calls == ["session-1"]
     assert not background_started.is_set()
+
+
+def test_honcho_latency_controls_respect_active_host_block(monkeypatch):
+    """Host-specific Honcho cadence controls must not be ignored.
+
+    Regression: ``hosts.hermes.dialecticCadence`` looked configured but the
+    provider read only the root JSON value, so gateway sessions silently fell
+    back to default dialectic cadence and fired slow peer.chat() work.
+    """
+    provider = HonchoMemoryProvider()
+    cfg = _configured_hybrid_config()
+    cfg.host = "hermes"
+    cfg.raw = {
+        "dialecticCadence": 9,
+        "contextCadence": 9,
+        "injectionFrequency": "every-turn",
+        "hosts": {
+            "hermes": {
+                "dialecticCadence": 0,
+                "contextCadence": 7,
+                "injectionFrequency": "first-turn",
+            }
+        },
+    }
+
+    monkeypatch.setattr(
+        "plugins.memory.honcho.client.HonchoClientConfig.from_global_config",
+        lambda: cfg,
+    )
+    monkeypatch.setattr(
+        HonchoMemoryProvider,
+        "_start_session_init_background",
+        lambda self, *, wait_timeout=0.0: None,
+    )
+
+    provider.initialize("session-1", platform="cli")
+
+    assert provider._dialectic_cadence == 0
+    assert provider._context_cadence == 7
+    assert provider._injection_frequency == "first-turn"

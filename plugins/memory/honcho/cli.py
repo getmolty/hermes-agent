@@ -1099,8 +1099,17 @@ def cmd_status(args) -> None:
     print(f"  Recall mode:    {hcfg.recall_mode}")
     print(f"  Context budget: {hcfg.context_tokens or '(uncapped)'} tokens")
     raw = getattr(hcfg, "raw", None) or {}
-    dialectic_cadence = raw.get("dialecticCadence") or 1
-    print(f"  Dialectic cad:  every {dialectic_cadence} turn{'s' if dialectic_cadence != 1 else ''}")
+    _dialectic_raw = raw.get("dialecticCadence")
+    if _dialectic_raw is None:
+        try:
+            _dialectic_raw = ((raw.get("hosts") or {}).get(hcfg.host) or {}).get("dialecticCadence")
+        except Exception:
+            _dialectic_raw = None
+    dialectic_cadence = 1 if _dialectic_raw is None else _dialectic_raw
+    if str(dialectic_cadence).strip() == "0":
+        print("  Dialectic cad:  disabled")
+    else:
+        print(f"  Dialectic cad:  every {dialectic_cadence} turn{'s' if dialectic_cadence != 1 else ''}")
     reasoning_cap = raw.get("reasoningLevelCap") or hcfg.reasoning_level_cap
     heuristic_on = "on" if hcfg.reasoning_heuristic else "off"
     print(f"  Reasoning:      base={hcfg.dialectic_reasoning_level}, cap={reasoning_cap}, heuristic={heuristic_on}")

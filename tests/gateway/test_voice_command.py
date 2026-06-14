@@ -632,6 +632,197 @@ class TestDiscordOpenAIRealtimeVoiceEngine:
         # 1 second of OpenAI input audio: 24kHz, mono, 16-bit.
         assert len(converted) == 24000 * 2
 
+    def test_realtime_pcm_to_discord_pcm_converts_rate_and_channels(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        # 20 ms of Realtime output audio: 24kHz, mono, 16-bit.
+        pcm = b"\x00\x10" * 480
+
+        converted, state = DiscordAdapter._realtime_pcm_to_discord_pcm(pcm)
+
+        # 20 ms of Discord-native output: 48kHz, stereo, 16-bit. The stateful
+        # ratecv upsampler holds one sample in flight on the first chunk.
+        assert len(converted) % 4 == 0
+        assert 3840 - 8 <= len(converted) <= 3840
+        assert state is not None
+
+        # Carried state keeps the stream duration-accurate across chunks.
+        converted2, state = DiscordAdapter._realtime_pcm_to_discord_pcm(pcm, state)
+        assert abs(len(converted) + len(converted2) - 2 * 3840) <= 8
+
+    def test_realtime_pcm_to_discord_pcm_carries_odd_byte_across_chunks(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        total = 0
+        state = None
+        for _ in range(100):
+            chunk, state = DiscordAdapter._realtime_pcm_to_discord_pcm(b"\x01\x02\x03" * 333, state)
+            assert len(chunk) % 4 == 0
+            total += len(chunk)
+        # 99900 bytes in == 49950 mono samples -> x2 rate, x2 channels out.
+        assert abs(total - 399600) <= 32
+
+    @pytest.mark.asyncio
+    async def test_run_response_streams_realtime_audio_delta_to_mixer_before_done(self):
+        import base64
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        class FakeRealtimeWS:
+            def __init__(self, mixer):
+                self.sent = []
+                self.mixer = mixer
+                self._frames = [
+                    {
+                        "type": "response.output_audio.delta",
+                        "delta": base64.b64encode(b"\x00\x10" * 480).decode("ascii"),
+                    },
+                    {"type": "response.done"},
+                ]
+
+            async def send(self, payload):
+                self.sent.append(json.loads(payload))
+
+            async def recv(self):
+                frame = self._frames.pop(0)
+                if frame["type"] == "response.done":
+                    assert self.mixer.streams, "mixer stream should start before response.done"
+                    assert self.mixer.streams[0].chunks, "audio delta should be queued before response.done"
+                return json.dumps(frame)
+
+        class FakeStream:
+            def __init__(self):
+                self.chunks = []
+                self.closed = False
+
+            def append(self, pcm):
+                self.chunks.append(pcm)
+
+            def close(self):
+                self.closed = True
+
+            @property
+            def finished(self):
+                return self.closed
+
+        class FakeMixer:
+            def __init__(self):
+                self.streams = []
+
+            def start_buffered_speech(self, **_kwargs):
+                stream = FakeStream()
+                self.streams.append(stream)
+                return stream
+
+        class FakeAdapter:
+            def __init__(self, mixer):
+                self._voice_mixers = {111: mixer}
+                self._voice_fx_cfg = {"speech_gain": 1.0}
+                self.played_files = []
+
+            def _reset_voice_timeout(self, _guild_id):
+                pass
+
+            async def play_in_voice_channel(self, guild_id, audio_file):
+                self.played_files.append((guild_id, audio_file))
+                return True
+
+            async def _send_realtime_debug_message(self, *_args, **_kwargs):
+                pass
+
+            async def _launch_realtime_memory_query_from_tool_call(self, *_args, **_kwargs):
+                pass
+
+            async def _launch_realtime_subagent_from_tool_call(self, *_args, **_kwargs):
+                pass
+
+        mixer = FakeMixer()
+        adapter = FakeAdapter(mixer)
+        session = OpenAIRealtimeSessionManager(adapter, 111)
+        session.ws = FakeRealtimeWS(mixer)
+
+        result = await session._run_response(user_id=42, turn_started_at=1.0)
+
+        assert result["success"] is True
+        assert result["streamed_audio"] is True
+        assert result["audio_bytes"] == 960
+        assert len(mixer.streams[0].chunks) == 1
+        # Stateful ratecv holds one sample in flight on the first chunk.
+        assert 3840 - 8 <= len(mixer.streams[0].chunks[0]) <= 3840
+        assert mixer.streams[0].closed is True
+        assert adapter.played_files == []
+
+    @pytest.mark.asyncio
+    async def test_run_response_closes_realtime_audio_stream_when_recv_times_out_after_delta(self):
+        import base64
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        class FakeRealtimeWS:
+            def __init__(self):
+                self.sent = []
+                self._frames = [
+                    {
+                        "type": "response.output_audio.delta",
+                        "delta": base64.b64encode(b"\x00\x10" * 480).decode("ascii"),
+                    },
+                ]
+
+            async def send(self, payload):
+                self.sent.append(json.loads(payload))
+
+            async def recv(self):
+                if self._frames:
+                    return json.dumps(self._frames.pop(0))
+                raise asyncio.TimeoutError("realtime recv stalled after audio stream opened")
+
+        class FakeStream:
+            def __init__(self):
+                self.chunks = []
+                self.closed = False
+
+            def append(self, pcm):
+                self.chunks.append(pcm)
+
+            def close(self):
+                self.closed = True
+
+            @property
+            def finished(self):
+                return self.closed
+
+        class FakeMixer:
+            def __init__(self):
+                self.streams = []
+
+            def start_buffered_speech(self, **_kwargs):
+                stream = FakeStream()
+                self.streams.append(stream)
+                return stream
+
+        class FakeAdapter:
+            def __init__(self, mixer):
+                self._voice_mixers = {111: mixer}
+                self._voice_fx_cfg = {"speech_gain": 1.0}
+
+            async def _send_realtime_debug_message(self, *_args, **_kwargs):
+                pass
+
+            async def _launch_realtime_memory_query_from_tool_call(self, *_args, **_kwargs):
+                pass
+
+            async def _launch_realtime_subagent_from_tool_call(self, *_args, **_kwargs):
+                pass
+
+        mixer = FakeMixer()
+        session = OpenAIRealtimeSessionManager(FakeAdapter(mixer), 111)
+        session.ws = FakeRealtimeWS()
+
+        with pytest.raises(asyncio.TimeoutError):
+            await session._run_response(user_id=42, turn_started_at=1.0)
+
+        assert mixer.streams, "audio delta should open a mixer BufferedPCMStream"
+        assert mixer.streams[0].chunks, "audio delta should queue before recv timeout"
+        assert mixer.streams[0].closed is True
+
     def test_realtime_latency_log_fields_are_grep_friendly_and_redacted(self):
         from plugins.platforms.discord.adapter import _format_realtime_latency_fields
 
@@ -3040,7 +3231,7 @@ class TestOpenAIRealtimeSubagentBridge:
                 pass
 
         monkeypatch.setattr(DiscordAdapter, "_load_openai_realtime_key", staticmethod(lambda: ("OPENAI_API_KEY", "sk-test")))
-        monkeypatch.setattr(DiscordAdapter, "_discord_pcm_to_realtime_pcm", staticmethod(lambda _pcm: b"\x00" * 48))
+        monkeypatch.setattr(DiscordAdapter, "_discord_pcm_to_realtime_pcm", staticmethod(lambda _pcm: b"\x00" * 4800))
         monkeypatch.setattr("websockets.sync.client.connect", lambda *a, **k: FakeWS())
 
         result = adapter._openai_realtime_audio_turn_sync(b"ignored", guild_id=111, user_id=42)
@@ -3050,7 +3241,8 @@ class TestOpenAIRealtimeSubagentBridge:
             session = sent[0]["session"]
             assert session["tools"][0]["name"] == "start_subagent_task"
             assert session["tool_choice"] == "auto"
-            assert "background worker" in session["instructions"]
+            assert "quietly hand off" in session["instructions"]
+            assert "call the appropriate tool immediately" in session["instructions"]
         finally:
             if result.get("file_path") and os.path.exists(result["file_path"]):
                 os.unlink(result["file_path"])
@@ -3075,6 +3267,135 @@ class TestOpenAIRealtimeSubagentBridge:
             "arguments": {"query": "Can you see the Bourbon app conversation?"},
         }]
         assert completed == {"mem-1"}
+
+    def test_realtime_tool_call_recorder_accepts_cancel_without_args(self):
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        tool_calls = []
+        completed = set()
+
+        OpenAIRealtimeSessionManager._append_realtime_tool_call(
+            tool_calls,
+            completed,
+            "cancel-1",
+            "cancel_background_task",
+            {},
+        )
+
+        assert tool_calls == [{
+            "call_id": "cancel-1",
+            "name": "cancel_background_task",
+            "arguments": {},
+        }]
+
+    def test_backend_items_use_trusted_system_role(self):
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        item = OpenAIRealtimeSessionManager._backend_item("Task done.")
+        assert item["item"]["role"] == "system"
+        assert item["item"]["content"][0]["text"].startswith("[HERMES BACKEND]")
+
+        result_item = OpenAIRealtimeSessionManager._subagent_result_item("rt-1", "All green.", failed=False)
+        assert result_item["item"]["role"] == "system"
+        text = result_item["item"]["content"][0]["text"]
+        assert text.startswith("[HERMES BACKEND]")
+        assert "moved on" in text, "result delivery must carry the topic-aware contract"
+        assert "All green." in text
+
+    def test_realtime_instructions_define_server_channel_and_cancel_tool(self, monkeypatch):
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        monkeypatch.delenv("OPENAI_REALTIME_INSTRUCTIONS", raising=False)
+        instructions = OpenAIRealtimeSessionManager.default_instructions()
+
+        assert "[HERMES BACKEND]" in instructions
+        assert "cancel_background_task" in instructions
+        assert "moved on" in instructions
+
+    @pytest.mark.asyncio
+    async def test_cancel_background_task_cancels_registered_tasks(self):
+        adapter = self._make_adapter()
+        adapter._send_realtime_debug_message = AsyncMock()
+
+        async def _never():
+            await asyncio.sleep(3600)
+
+        t1 = asyncio.ensure_future(_never())
+        t2 = asyncio.ensure_future(_never())
+        adapter._register_realtime_bg_task(111, "rt-aaa", t1)
+        adapter._register_realtime_bg_task(111, "mem-bbb", t2)
+
+        # Targeted cancel stops only the named task.
+        await adapter._cancel_realtime_bg_from_tool_call(111, 42, {"arguments": {"task_id": "rt-aaa"}})
+        await asyncio.gather(t1, return_exceptions=True)
+        assert t1.cancelled()
+        assert not t2.done()
+
+        # Bare cancel stops everything still running.
+        await adapter._cancel_realtime_bg_from_tool_call(111, 42, {"arguments": {}})
+        await asyncio.gather(t2, return_exceptions=True)
+        assert t2.cancelled()
+        assert adapter._realtime_bg_tasks[111] == {}
+
+    def test_realtime_tool_acknowledgement_rotates_and_special_cases_memory(self):
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        session = OpenAIRealtimeSessionManager(self._make_adapter(), 111)
+
+        assert session._next_tool_acknowledgement([
+            {"name": "start_subagent_task", "arguments": {"task": "Research this"}}
+        ]) == "On it — I’ll run that quietly and report back."
+        assert session._next_tool_acknowledgement([
+            {"name": "start_subagent_task", "arguments": {"task": "Build this"}}
+        ]) == "Got it. I’ll take care of that in the background."
+
+        memory_session = OpenAIRealtimeSessionManager(self._make_adapter(), 111)
+        assert memory_session._next_tool_acknowledgement([
+            {"name": "query_hermes_memory", "arguments": {"query": "What did Joe say?"}}
+        ]) == "Let me check that."
+
+    def test_realtime_access_mode_controls_subagent_yolo_flag_and_prompt(self, monkeypatch):
+        from plugins.platforms.discord.adapter import DiscordAdapter, OpenAIRealtimeSessionManager
+
+        monkeypatch.delenv("HERMES_REALTIME_ACCESS_MODE", raising=False)
+        assert OpenAIRealtimeSessionManager._realtime_access_mode() == "paranoid"
+        paranoid_cmd = DiscordAdapter._build_realtime_subagent_command("terminal,file", "do work")
+        assert "--yolo" not in paranoid_cmd
+        paranoid_prompt = DiscordAdapter._build_realtime_subagent_prompt(
+            {"task": "inspect repo", "task_type": "debugging"},
+            guild_id=111,
+            user_id=42,
+        )
+        assert "Realtime access mode: paranoid" in paranoid_prompt
+        assert "human-gated" in paranoid_prompt
+
+        monkeypatch.setenv("HERMES_REALTIME_ACCESS_MODE", "yolo")
+        assert OpenAIRealtimeSessionManager._realtime_access_mode() == "yolo"
+        yolo_cmd = DiscordAdapter._build_realtime_subagent_command("terminal,file", "do work")
+        assert yolo_cmd[:4] == [sys.executable, "-m", "hermes_cli.main", "--yolo"]
+        assert yolo_cmd[4] == "chat"
+        yolo_prompt = DiscordAdapter._build_realtime_subagent_prompt(
+            {"task": "run tests", "task_type": "debugging"},
+            guild_id=111,
+            user_id=42,
+        )
+        assert "Realtime access mode: yolo" in yolo_prompt
+        assert "Hermes --yolo" in yolo_prompt
+
+    @pytest.mark.asyncio
+    async def test_realtime_debug_messages_are_quiet_by_default_but_errors_can_force(self, monkeypatch):
+        adapter = self._make_adapter()
+        channel = SimpleNamespace(send=AsyncMock())
+        client = MagicMock()
+        client.get_channel.return_value = channel
+        adapter._client = client
+
+        monkeypatch.delenv("HERMES_DISCORD_REALTIME_DEBUG", raising=False)
+        await adapter._send_realtime_debug_message(111, "routine background start")
+        channel.send.assert_not_awaited()
+
+        await adapter._send_realtime_debug_message(111, "actual error", force=True)
+        channel.send.assert_awaited_once_with("actual error")
 
     def test_realtime_memory_context_includes_recent_sessions_and_redacts(self, tmp_path, monkeypatch):
         import sqlite3
@@ -3171,6 +3492,170 @@ class TestOpenAIRealtimeSubagentBridge:
         assert result["success"] is False
         assert result["route"] == "cli_fallback"
 
+    def test_realtime_memory_broker_prefers_provider_for_profile_query(self, tmp_path, monkeypatch):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        home = tmp_path / "hermes-home"
+        (home / "memories").mkdir(parents=True)
+        (home / "memories" / "USER.md").write_text("User prefers terse operator language.\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        seen_calls = []
+
+        def fake_tool_call(tool_name, args):
+            seen_calls.append((tool_name, args))
+            return json.dumps({"result": "Joe prefers terse, evidence-first answers with no filler."})
+
+        provider = SimpleNamespace(name=lambda: "honcho", handle_tool_call=fake_tool_call)
+
+        result = DiscordAdapter._answer_realtime_memory_query_sync(
+            "What communication style does Joe prefer?",
+            context="voice",
+            memory_provider=provider,
+        )
+
+        assert result["success"] is True
+        assert result["route"] == "memory_provider"
+        assert "From Hermes long-term memory:" in result["body"]
+        assert "terse, evidence-first" in result["body"]
+        assert seen_calls == [("honcho_reasoning", {"query": "What communication style does Joe prefer?"})]
+
+    def test_realtime_memory_broker_provider_miss_falls_through_to_files(self, tmp_path, monkeypatch):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        home = tmp_path / "hermes-home"
+        (home / "memories").mkdir(parents=True)
+        (home / "memories" / "USER.md").write_text("User prefers terse operator language.\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        provider = SimpleNamespace(
+            name=lambda: "honcho",
+            handle_tool_call=lambda _tool, _args: json.dumps({"result": ""}),
+        )
+
+        result = DiscordAdapter._answer_realtime_memory_query_sync(
+            "What communication style does Joe prefer?",
+            memory_provider=provider,
+        )
+
+        assert result["success"] is True
+        assert result["route"] == "memory_files"
+        assert "terse operator language" in result["body"]
+
+    def test_realtime_memory_broker_provider_answers_deep_query_before_cli(self, tmp_path, monkeypatch):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        home = tmp_path / "hermes-home"
+        (home / "memories").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        provider = SimpleNamespace(
+            name=lambda: "honcho",
+            handle_tool_call=lambda _tool, _args: json.dumps(
+                {"result": "Across the last month Joe consolidated infra on the M3 host."}
+            ),
+        )
+
+        result = DiscordAdapter._answer_realtime_memory_query_sync(
+            "Synthesize my last month of infrastructure decisions and rank the tradeoffs.",
+            memory_provider=provider,
+        )
+
+        assert result["success"] is True
+        assert result["route"] == "memory_provider"
+        assert "consolidated infra" in result["body"]
+
+    def test_realtime_memory_broker_provider_name_property_supported(self, tmp_path, monkeypatch):
+        """Regression: real providers expose .name as a property, not a method."""
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        home = tmp_path / "hermes-home"
+        (home / "memories").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        class PropertyNameProvider:
+            @property
+            def name(self):
+                return "honcho"
+
+            def handle_tool_call(self, tool_name, args):
+                return json.dumps({"result": "Joe's preference is short spoken replies."})
+
+        result = DiscordAdapter._answer_realtime_memory_query_sync(
+            "What communication style does Joe prefer?",
+            memory_provider=PropertyNameProvider(),
+        )
+
+        assert result["success"] is True
+        assert result["route"] == "memory_provider"
+        assert "short spoken replies" in result["body"]
+
+    @pytest.mark.asyncio
+    async def test_realtime_memory_query_task_defaults_to_hermes_chat_worker(self, tmp_path, monkeypatch):
+        """Default route: a real Hermes chat worker answers (native Honcho), not the broker."""
+        home = tmp_path / "hermes-home"
+        (home / "memories").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("HERMES_REALTIME_MEMORY_BROKER", raising=False)
+
+        adapter = self._make_adapter()
+        adapter._send_realtime_debug_message = AsyncMock()
+        adapter._answer_realtime_memory_query_sync = MagicMock(
+            side_effect=AssertionError("broker must not run by default")
+        )
+        fake_session = SimpleNamespace(inject_memory_result=AsyncMock())
+        adapter._realtime_sessions[111] = fake_session
+
+        spawned = {}
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"Joe prefers terse, evidence-first answers.", b"")
+
+        async def fake_subprocess(*cmd, **_kwargs):
+            spawned["cmd"] = list(cmd)
+            return FakeProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_subprocess)
+
+        await adapter._run_realtime_memory_query_task(
+            111,
+            42,
+            {"query": "What communication style does Joe prefer?"},
+            "mem-default",
+        )
+
+        assert "chat" in spawned["cmd"]
+        assert "memory,session_search" in spawned["cmd"]
+        prompt_arg = spawned["cmd"][-1]
+        assert "honcho_reasoning" in prompt_arg
+        injected = fake_session.inject_memory_result.await_args.args
+        assert injected[0] == "mem-default"
+        assert "terse, evidence-first" in injected[1]
+        assert fake_session.inject_memory_result.await_args.kwargs == {"failed": False}
+
+    def test_realtime_memory_context_includes_provider_layer_and_redacts(self, tmp_path, monkeypatch):
+        home = tmp_path / "hermes-home"
+        (home / "memories").mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+
+        adapter = self._make_adapter()
+        adapter._realtime_memory_provider_context = lambda wait_seconds=0.0: (
+            "Joe is mid-build on the DNAQUANT dashboards.\napi_key=live-secret"
+        )
+
+        digest = adapter._build_realtime_memory_context(111)
+
+        assert "Long-term memory context:" in digest
+        assert "DNAQUANT" in digest
+        assert "live-secret" not in digest
+
+    def test_infer_realtime_subagent_toolsets_includes_memory_for_coding(self):
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        toolsets = DiscordAdapter._infer_realtime_subagent_toolsets({"task_type": "coding"}).split(",")
+
+        assert "memory" in toolsets
+
     @pytest.mark.asyncio
     async def test_realtime_memory_query_task_uses_broker_no_subprocess_for_simple_query(self, tmp_path, monkeypatch):
         from plugins.platforms.discord.adapter import DiscordAdapter
@@ -3180,6 +3665,7 @@ class TestOpenAIRealtimeSubagentBridge:
         memories.mkdir(parents=True)
         (memories / "USER.md").write_text("User prefers English-only Telegram.\n", encoding="utf-8")
         monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("HERMES_REALTIME_MEMORY_BROKER", "true")
         subprocess_spy = MagicMock(side_effect=AssertionError("CLI must not spawn"))
         monkeypatch.setattr(asyncio, "create_subprocess_exec", subprocess_spy)
 
@@ -3233,6 +3719,83 @@ class TestOpenAIRealtimeSubagentBridge:
             await session.stop()
 
     @pytest.mark.asyncio
+    async def test_persistent_realtime_audio_turn_uses_input_buffer_append_commit(self, monkeypatch):
+        import base64
+        from plugins.platforms.discord.adapter import DiscordAdapter, OpenAIRealtimeSessionManager
+
+        adapter = self._make_adapter()
+        adapter._build_realtime_memory_context = MagicMock(return_value="")
+        adapter.play_in_voice_channel = AsyncMock(return_value=True)
+        sent = []
+
+        class FakeAsyncWS:
+            def __init__(self):
+                self.frames = [
+                    {"type": "response.output_audio.delta", "delta": base64.b64encode(b"\x00" * 64).decode("ascii")},
+                    {"type": "response.done"},
+                ]
+
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+
+            async def recv(self):
+                return json.dumps(self.frames.pop(0))
+
+            async def close(self):
+                pass
+
+        async def fake_connect(*_args, **_kwargs):
+            return FakeAsyncWS()
+
+        monkeypatch.setenv("HERMES_REALTIME_TURN_DETECTION", "manual")
+        monkeypatch.setattr(DiscordAdapter, "_load_openai_realtime_key", staticmethod(lambda: ("OPENAI_API_KEY", "sk-test")))
+        monkeypatch.setattr(DiscordAdapter, "_discord_pcm_to_realtime_pcm", staticmethod(lambda _pcm: b"\x01" * 4800))
+        monkeypatch.setattr("websockets.asyncio.client.connect", fake_connect)
+
+        session = OpenAIRealtimeSessionManager(adapter, 111)
+        result = await session.send_user_audio(42, b"ignored")
+        try:
+            assert result["success"] is True
+            types_sent = [event["type"] for event in sent]
+            assert types_sent == [
+                "session.update",
+                "input_audio_buffer.append",
+                "input_audio_buffer.commit",
+                "response.create",
+            ]
+            input_cfg = sent[0]["session"]["audio"]["input"]
+            assert input_cfg["format"] == {"type": "audio/pcm", "rate": 24000}
+            assert input_cfg["turn_detection"] is None
+            assert sent[1]["audio"] == base64.b64encode(b"\x01" * 4800).decode("ascii")
+            adapter.play_in_voice_channel.assert_awaited_once()
+            assert "conversation.item.create" not in types_sent
+        finally:
+            await session.stop()
+
+    @pytest.mark.asyncio
+    async def test_persistent_realtime_audio_turn_does_not_commit_under_100ms(self, monkeypatch):
+        from plugins.platforms.discord.adapter import DiscordAdapter, OpenAIRealtimeSessionManager
+
+        adapter = self._make_adapter()
+        adapter._build_realtime_memory_context = MagicMock(return_value="")
+        sent = []
+
+        async def fake_connect(*_args, **_kwargs):
+            raise AssertionError("too-short audio should not open a Realtime websocket")
+
+        monkeypatch.setenv("HERMES_REALTIME_TURN_DETECTION", "manual")
+        monkeypatch.setattr(DiscordAdapter, "_load_openai_realtime_key", staticmethod(lambda: ("OPENAI_API_KEY", "sk-test")))
+        monkeypatch.setattr(DiscordAdapter, "_discord_pcm_to_realtime_pcm", staticmethod(lambda _pcm: b"\x01" * 4798))
+        monkeypatch.setattr("websockets.asyncio.client.connect", fake_connect)
+
+        session = OpenAIRealtimeSessionManager(adapter, 111)
+        result = await session.send_user_audio(42, b"ignored")
+
+        assert result["success"] is False
+        assert "too short" in result["error"]
+        assert sent == []
+
+    @pytest.mark.asyncio
     async def test_process_realtime_voice_input_uses_persistent_session(self):
         adapter = self._make_adapter()
         fake_session = SimpleNamespace(send_user_audio=AsyncMock(return_value={"success": True}))
@@ -3243,6 +3806,573 @@ class TestOpenAIRealtimeSubagentBridge:
 
         fake_session.send_user_audio.assert_awaited_once_with(42, b"pcm")
         adapter._send_realtime_debug_message.assert_not_awaited()
+
+
+class TestRealtimeFullDuplexStreaming:
+    """Full-duplex streaming: server VAD turn taking + barge-in interruption."""
+
+    def _make_streaming_session(self, adapter=None, guild_id=111):
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        class FakeAdapter:
+            def __init__(self):
+                self._voice_mixers = {}
+                self._voice_clients = {}
+                self._voice_fx_cfg = {"speech_gain": 1.0}
+                self.timeout_resets = 0
+                self.subagent_calls = []
+                self.memory_calls = []
+
+            def _reset_voice_timeout(self, _guild_id):
+                self.timeout_resets += 1
+
+            async def _send_realtime_debug_message(self, *_args, **_kwargs):
+                pass
+
+            async def _launch_realtime_subagent_from_tool_call(self, guild_id, user_id, tool_call):
+                self.subagent_calls.append((guild_id, user_id, tool_call))
+
+            async def _launch_realtime_memory_query_from_tool_call(self, guild_id, user_id, tool_call):
+                self.memory_calls.append((guild_id, user_id, tool_call))
+
+            @staticmethod
+            def _parse_realtime_tool_arguments(raw):
+                from plugins.platforms.discord.adapter import DiscordAdapter
+                return DiscordAdapter._parse_realtime_tool_arguments(raw)
+
+            @staticmethod
+            def _discord_pcm_to_realtime_pcm(pcm):
+                from plugins.platforms.discord.adapter import DiscordAdapter
+                return DiscordAdapter._discord_pcm_to_realtime_pcm(pcm)
+
+        fake_adapter = adapter or FakeAdapter()
+        return OpenAIRealtimeSessionManager(fake_adapter, guild_id), fake_adapter
+
+    def test_input_audio_config_defaults_to_semantic_vad_with_gated_barge_in(self, monkeypatch):
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        monkeypatch.delenv("HERMES_REALTIME_TURN_DETECTION", raising=False)
+        monkeypatch.delenv("HERMES_REALTIME_NOISE_REDUCTION", raising=False)
+        monkeypatch.delenv("HERMES_REALTIME_BARGE_IN_GATE", raising=False)
+        config = OpenAIRealtimeSessionManager._input_audio_config()
+
+        # interrupt_response stays off by default: the client-side RMS gate
+        # owns barge-in so background noise can't cancel replies server-side.
+        assert config["turn_detection"] == {
+            "type": "semantic_vad",
+            "eagerness": "auto",
+            "create_response": True,
+            "interrupt_response": False,
+        }
+        assert config["noise_reduction"] == {"type": "far_field"}
+        assert OpenAIRealtimeSessionManager._turn_detection_mode() == "semantic_vad"
+
+    def test_input_audio_config_gate_off_restores_server_interrupt(self, monkeypatch):
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        monkeypatch.delenv("HERMES_REALTIME_TURN_DETECTION", raising=False)
+        monkeypatch.setenv("HERMES_REALTIME_BARGE_IN_GATE", "off")
+        config = OpenAIRealtimeSessionManager._input_audio_config()
+
+        assert config["turn_detection"]["interrupt_response"] is True
+
+    def test_input_audio_config_server_vad_respects_barge_in_gate(self, monkeypatch):
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        monkeypatch.setenv("HERMES_REALTIME_TURN_DETECTION", "server_vad")
+        monkeypatch.delenv("HERMES_REALTIME_BARGE_IN_GATE", raising=False)
+        config = OpenAIRealtimeSessionManager._input_audio_config()
+
+        assert config["turn_detection"]["type"] == "server_vad"
+        assert config["turn_detection"]["create_response"] is True
+        assert config["turn_detection"]["interrupt_response"] is False
+        assert config["turn_detection"]["prefix_padding_ms"] == 300
+
+        monkeypatch.setenv("HERMES_REALTIME_BARGE_IN_GATE", "off")
+        config = OpenAIRealtimeSessionManager._input_audio_config()
+
+        assert config["turn_detection"]["interrupt_response"] is True
+
+    def test_input_audio_config_manual_mode_disables_turn_detection(self, monkeypatch):
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        monkeypatch.setenv("HERMES_REALTIME_TURN_DETECTION", "manual")
+        config = OpenAIRealtimeSessionManager._input_audio_config()
+
+        assert config["turn_detection"] is None
+        assert OpenAIRealtimeSessionManager._turn_detection_mode() == "manual"
+
+    def test_input_audio_config_enables_input_transcription(self, monkeypatch):
+        from plugins.platforms.discord.adapter import OpenAIRealtimeSessionManager
+
+        monkeypatch.delenv("HERMES_REALTIME_TRANSCRIPTION_MODEL", raising=False)
+        monkeypatch.delenv("HERMES_REALTIME_TRANSCRIPTION_LANGUAGE", raising=False)
+        config = OpenAIRealtimeSessionManager._input_audio_config()
+
+        assert config["transcription"] == {"model": "gpt-realtime-whisper", "language": "en"}
+
+        monkeypatch.setenv("HERMES_REALTIME_TRANSCRIPTION_MODEL", "off")
+        config = OpenAIRealtimeSessionManager._input_audio_config()
+
+        assert "transcription" not in config
+
+    @pytest.mark.asyncio
+    async def test_completed_turn_syncs_user_and_assistant_transcripts_to_memory(self):
+        session, fake_adapter = self._make_streaming_session()
+        fake_adapter._sync_realtime_turn_to_memory = MagicMock()
+
+        await session._handle_stream_frame(json.dumps({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "Remember that the bourbon site ships Friday.",
+        }))
+        await session._handle_stream_frame(json.dumps({"type": "response.created", "response": {"id": "resp_1"}}))
+        await session._handle_stream_frame(json.dumps({
+            "type": "response.output_audio_transcript.delta",
+            "delta": "Noted: Friday ship date.",
+        }))
+        await session._handle_stream_frame(json.dumps({"type": "response.done", "response": {"status": "completed"}}))
+
+        fake_adapter._sync_realtime_turn_to_memory.assert_called_once_with(
+            "Remember that the bourbon site ships Friday.", "Noted: Friday ship date."
+        )
+        assert session._pending_user_transcripts == []
+
+    @pytest.mark.asyncio
+    async def test_cancelled_turn_keeps_user_transcript_for_next_sync(self):
+        session, fake_adapter = self._make_streaming_session()
+        fake_adapter._sync_realtime_turn_to_memory = MagicMock()
+
+        await session._handle_stream_frame(json.dumps({
+            "type": "conversation.item.input_audio_transcription.completed",
+            "transcript": "Actually wait, change of plans.",
+        }))
+        await session._handle_stream_frame(json.dumps({"type": "response.created", "response": {"id": "resp_1"}}))
+        await session._handle_stream_frame(json.dumps({"type": "response.cancelled", "response": {"status": "cancelled"}}))
+
+        fake_adapter._sync_realtime_turn_to_memory.assert_not_called()
+        assert session._pending_user_transcripts == ["Actually wait, change of plans."]
+
+        await session._handle_stream_frame(json.dumps({"type": "response.created", "response": {"id": "resp_2"}}))
+        await session._handle_stream_frame(json.dumps({
+            "type": "response.output_audio_transcript.delta",
+            "delta": "Got it, new plan.",
+        }))
+        await session._handle_stream_frame(json.dumps({"type": "response.done", "response": {"status": "completed"}}))
+
+        fake_adapter._sync_realtime_turn_to_memory.assert_called_once_with(
+            "Actually wait, change of plans.", "Got it, new plan."
+        )
+
+    @pytest.mark.asyncio
+    async def test_cancel_tool_call_dispatches_and_acks_via_backend_channel(self):
+        session, fake_adapter = self._make_streaming_session()
+        cancel_calls = []
+
+        async def _cancel(guild_id, user_id, tool_call):
+            cancel_calls.append((guild_id, user_id, tool_call))
+
+        fake_adapter._cancel_realtime_bg_from_tool_call = _cancel
+        sent = []
+
+        class FakeWS:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+
+        session.ws = FakeWS()
+        session._connected = True
+
+        await session._handle_stream_frame(json.dumps({"type": "response.created", "response": {"id": "r1"}}))
+        await session._handle_stream_frame(json.dumps({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "function_call",
+                "name": "cancel_background_task",
+                "call_id": "c1",
+                "arguments": "{}",
+            },
+        }))
+        await session._handle_stream_frame(json.dumps({"type": "response.done", "response": {"status": "completed"}}))
+
+        assert cancel_calls, "cancel tool call must dispatch to the cancel handler"
+        assert cancel_calls[0][0] == 111
+        assert cancel_calls[0][2]["name"] == "cancel_background_task"
+        # The spoken ack for the tool-only turn rides the trusted backend channel.
+        ack_items = [e for e in sent if e.get("type") == "conversation.item.create"]
+        assert ack_items and ack_items[0]["item"]["role"] == "system"
+        assert ack_items[0]["item"]["content"][0]["text"].startswith("[HERMES BACKEND]")
+
+    @pytest.mark.asyncio
+    async def test_send_user_audio_streaming_mode_appends_without_commit(self, monkeypatch):
+        monkeypatch.setenv("HERMES_REALTIME_TURN_DETECTION", "semantic_vad")
+        session, _adapter = self._make_streaming_session()
+        sent = []
+
+        class FakeWS:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+
+        session.ws = FakeWS()
+        session._connected = True
+
+        result = await session.send_user_audio(42, b"\x00\x00" * 1920)
+
+        assert result["success"] is True
+        assert result["streamed_input"] is True
+        types_sent = [event["type"] for event in sent]
+        assert types_sent == ["input_audio_buffer.append"]
+        assert session.last_user_id == 42
+
+    @pytest.mark.asyncio
+    async def test_speech_started_flushes_playback_and_truncates_history(self, monkeypatch):
+        monkeypatch.setenv("HERMES_REALTIME_TURN_DETECTION", "semantic_vad")
+        session, _adapter = self._make_streaming_session()
+        sent = []
+
+        class FakeWS:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+
+        class FakeStream:
+            def __init__(self):
+                self.played_ms = 40
+                self.flushed = False
+                self.finished = False
+
+            def flush(self):
+                self.flushed = True
+                self.finished = True
+
+        session.ws = FakeWS()
+        session._connected = True
+        state = session._new_stream_state("resp_1")
+        stream = FakeStream()
+        session._speech_stream = stream
+        state["audio_stream"] = stream
+        state["play_offset_ms"] = 0.0
+        state["item_id"] = "item_1"
+        state["received_bytes"] = 4800  # 100ms of 24k mono PCM16
+        session._stream_state = state
+        session._active_response_id = "resp_1"
+        session.note_mic_rms(4000)  # genuinely loud speech: gate must allow the barge-in
+
+        await session._handle_stream_frame(json.dumps({"type": "input_audio_buffer.speech_started"}))
+
+        assert stream.flushed is True, "barge-in must cut local playback immediately"
+        assert session._speech_stream is None
+        cancels = [e for e in sent if e["type"] == "response.cancel"]
+        assert cancels, "gated barge-in must cancel the in-flight response itself"
+        truncates = [e for e in sent if e["type"] == "conversation.item.truncate"]
+        assert truncates == [{
+            "type": "conversation.item.truncate",
+            "item_id": "item_1",
+            "content_index": 0,
+            "audio_end_ms": 40,
+        }]
+        assert session._user_speaking is True
+
+    @pytest.mark.asyncio
+    async def test_speech_started_skips_truncate_when_fully_played(self, monkeypatch):
+        monkeypatch.setenv("HERMES_REALTIME_TURN_DETECTION", "semantic_vad")
+        session, _adapter = self._make_streaming_session()
+        sent = []
+
+        class FakeWS:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+
+        class FakeStream:
+            played_ms = 100
+            finished = False
+
+            def flush(self):
+                pass
+
+        session.ws = FakeWS()
+        session._connected = True
+        state = session._new_stream_state("resp_1")
+        stream = FakeStream()
+        session._speech_stream = stream
+        state["audio_stream"] = stream
+        state["play_offset_ms"] = 0.0
+        state["item_id"] = "item_1"
+        state["received_bytes"] = 4800  # exactly 100ms: user heard everything
+        session._stream_state = state
+        session.note_mic_rms(4000)
+
+        await session._handle_stream_frame(json.dumps({"type": "input_audio_buffer.speech_started"}))
+
+        assert all(e["type"] != "conversation.item.truncate" for e in sent)
+
+    @pytest.mark.asyncio
+    async def test_speech_started_from_noise_keeps_playback(self, monkeypatch):
+        """VAD fires on background noise: the gate must NOT cut the reply."""
+        monkeypatch.setenv("HERMES_REALTIME_TURN_DETECTION", "semantic_vad")
+        session, _adapter = self._make_streaming_session()
+        sent = []
+
+        class FakeWS:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+
+        class FakeStream:
+            def __init__(self):
+                self.played_ms = 40
+                self.flushed = False
+                self.finished = False
+
+            def flush(self):
+                self.flushed = True
+
+        session.ws = FakeWS()
+        session._connected = True
+        state = session._new_stream_state("resp_1")
+        stream = FakeStream()
+        session._speech_stream = stream
+        state["audio_stream"] = stream
+        session._stream_state = state
+        session._active_response_id = "resp_1"
+        session.note_mic_rms(300)  # below the barge floor: road noise, not speech
+
+        await session._handle_stream_frame(json.dumps({"type": "input_audio_buffer.speech_started"}))
+
+        assert stream.flushed is False, "noise must not interrupt playback"
+        assert session._speech_stream is stream
+        assert sent == [], "no cancel/truncate for a suppressed barge-in"
+        assert session._user_speaking is True
+
+    @pytest.mark.asyncio
+    async def test_stream_audio_delta_feeds_mixer_and_tracks_item(self, monkeypatch):
+        import base64
+        monkeypatch.setenv("HERMES_REALTIME_TURN_DETECTION", "semantic_vad")
+        session, adapter = self._make_streaming_session()
+
+        class FakeStream:
+            def __init__(self):
+                self.chunks = []
+                self.finished = False
+                self.played_ms = 0
+
+            def append(self, pcm):
+                self.chunks.append(pcm)
+
+            def close(self):
+                self.finished = True
+
+        class FakeMixer:
+            def __init__(self):
+                self.streams = []
+
+            def start_buffered_speech(self, **_kwargs):
+                stream = FakeStream()
+                self.streams.append(stream)
+                return stream
+
+        mixer = FakeMixer()
+        adapter._voice_mixers[111] = mixer
+        session._stream_state = session._new_stream_state("resp_1")
+
+        await session._handle_stream_frame(json.dumps({
+            "type": "response.output_audio.delta",
+            "item_id": "item_7",
+            "delta": base64.b64encode(b"\x00\x10" * 480).decode("ascii"),
+        }))
+
+        assert session._stream_state["item_id"] == "item_7"
+        assert session._stream_state["received_bytes"] == 960
+        assert len(mixer.streams) == 1
+        assert mixer.streams[0].chunks, "delta should stream into the mixer immediately"
+
+    @pytest.mark.asyncio
+    async def test_back_to_back_responses_share_one_stream_no_overlap(self, monkeypatch):
+        """OpenAI streams audio faster than realtime: a second reply must queue
+        behind the first in ONE stream, not start a parallel (overlapping) one."""
+        import base64
+        monkeypatch.setenv("HERMES_REALTIME_TURN_DETECTION", "semantic_vad")
+        session, adapter = self._make_streaming_session()
+        sent = []
+
+        class FakeWS:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+
+        class FakeStream:
+            def __init__(self):
+                self.chunks = []
+                self.finished = False
+                self.played_ms = 0
+                self.buffered_bytes = 1  # still draining
+
+            def append(self, pcm):
+                self.chunks.append(pcm)
+
+            def close(self):
+                self.finished = True
+
+        class FakeMixer:
+            def __init__(self):
+                self.streams = []
+
+            def start_buffered_speech(self, **_kwargs):
+                stream = FakeStream()
+                self.streams.append(stream)
+                return stream
+
+        session.ws = FakeWS()
+        session._connected = True
+        mixer = FakeMixer()
+        adapter._voice_mixers[111] = mixer
+        delta = base64.b64encode(b"\x00\x10" * 480).decode("ascii")
+
+        await session._handle_stream_frame(json.dumps({"type": "response.created", "response": {"id": "r1"}}))
+        await session._handle_stream_frame(json.dumps({"type": "response.output_audio.delta", "item_id": "i1", "delta": delta}))
+        await session._handle_stream_frame(json.dumps({"type": "response.done", "response": {"status": "completed"}}))
+        # Second reply arrives while the first is still draining (buffered_bytes > 0).
+        await session._handle_stream_frame(json.dumps({"type": "response.created", "response": {"id": "r2"}}))
+        await session._handle_stream_frame(json.dumps({"type": "response.output_audio.delta", "item_id": "i2", "delta": delta}))
+
+        assert len(mixer.streams) == 1, "second response must reuse the draining stream, not overlap it"
+        assert len(mixer.streams[0].chunks) == 2
+        # The second response's truncate offset starts after the first reply's audio.
+        assert session._stream_state["play_offset_ms"] > 0
+
+        # Finish the second response, then let the idle closer retire the
+        # stream once it has drained.
+        await session._handle_stream_frame(json.dumps({"type": "response.done", "response": {"status": "completed"}}))
+        mixer.streams[0].buffered_bytes = 0
+        for _ in range(40):
+            if session._speech_stream is None:
+                break
+            await asyncio.sleep(0.02)
+        assert session._speech_stream is None
+        assert mixer.streams[0].finished is True
+
+    @pytest.mark.asyncio
+    async def test_stream_response_done_dispatches_tools_and_speaks_ack(self, monkeypatch):
+        monkeypatch.setenv("HERMES_REALTIME_TURN_DETECTION", "semantic_vad")
+        session, adapter = self._make_streaming_session()
+        sent = []
+
+        class FakeWS:
+            async def send(self, payload):
+                sent.append(json.loads(payload))
+
+        session.ws = FakeWS()
+        session._connected = True
+        session.last_user_id = 42
+        session._stream_state = session._new_stream_state("resp_1")
+
+        await session._handle_stream_frame(json.dumps({
+            "type": "response.function_call_arguments.done",
+            "call_id": "call_1",
+            "name": "start_subagent_task",
+            "arguments": json.dumps({"task": "research X"}),
+        }))
+        await session._handle_stream_frame(json.dumps({
+            "type": "response.done",
+            "response": {"status": "completed"},
+        }))
+
+        assert adapter.subagent_calls and adapter.subagent_calls[0][1] == 42
+        assert adapter.subagent_calls[0][2]["arguments"] == {"task": "research X"}
+        # No audio came with the tool call: a spoken ack is requested through
+        # the normal streaming path (item + response.create), not a WAV file.
+        types_sent = [e["type"] for e in sent]
+        assert "conversation.item.create" in types_sent
+        assert "response.create" in types_sent
+        assert adapter.timeout_resets >= 1
+
+    def test_buffered_pcm_stream_tracks_played_ms_and_flushes(self):
+        pytest.importorskip("numpy")
+        from plugins.platforms.discord.voice_mixer import BufferedPCMStream, FRAME_SIZE
+
+        stream = BufferedPCMStream("test")
+        stream.append(b"\x01\x00" * FRAME_SIZE)  # two frames of audio
+        assert stream.read_frame() is not None
+        assert stream.played_ms == 20
+        assert stream.read_frame() is not None
+        assert stream.played_ms == 40
+        # Keep-alive silence while waiting for more deltas doesn't count.
+        assert stream.read_frame() is not None
+        assert stream.played_ms == 40
+
+        stream.append(b"\x01\x00" * FRAME_SIZE)
+        stream.flush()
+        assert stream.finished is True
+        assert stream.read_frame() is None
+        assert stream.played_ms == 40
+
+    def test_mixer_stop_speech_flushes_buffered_streams(self):
+        pytest.importorskip("numpy")
+        from plugins.platforms.discord.voice_mixer import VoiceMixer, FRAME_SIZE
+
+        mixer = VoiceMixer()
+        stream = mixer.start_buffered_speech(name="s")
+        stream.append(b"\x01\x00" * FRAME_SIZE)
+        mixer.stop_speech()
+        assert stream.finished is True
+
+    @pytest.mark.asyncio
+    async def test_pump_feeds_silence_when_mic_goes_quiet(self):
+        """Discord stops sending packets on silence; the pump must synthesize
+        silence at realtime cadence or server VAD never sees the turn end."""
+        from plugins.platforms.discord.adapter import DiscordAdapter
+
+        class FakeSession:
+            def __init__(self):
+                self.appends = []
+                self.last_user_id = 0
+
+            async def append_audio(self, pcm):
+                self.appends.append(pcm)
+                return True
+
+        adapter = object.__new__(DiscordAdapter)
+        session = FakeSession()
+        adapter._realtime_sessions = {1: session}
+        adapter._realtime_stream_queues = {1: asyncio.Queue()}
+        adapter._realtime_input_resamplers = {1: {}}
+        adapter._realtime_stream_auth = {1: {42: True}}
+        adapter._client = None
+
+        pump = asyncio.ensure_future(adapter._realtime_stream_pump(1))
+        # One real mic frame (20ms 48k stereo), then the mic goes quiet.
+        adapter._realtime_stream_queues[1].put_nowait((42, b"\x01\x00" * 1920))
+        await asyncio.sleep(0.35)
+        pump.cancel()
+        try:
+            await pump
+        except asyncio.CancelledError:
+            pass
+
+        assert session.appends, "real frame should be appended"
+        silence = b"".join(session.appends[1:])
+        # ~300ms of synthesized silence at 24k mono PCM16 (= 48 bytes/ms);
+        # generous lower bound for event-loop jitter.
+        assert len(silence) >= 48 * 150, f"expected >=150ms of silence feed, got {len(silence)/48:.0f}ms"
+        assert silence == b"\x00" * len(silence)
+
+    @pytest.mark.asyncio
+    async def test_voice_receiver_frame_sink_bypasses_buffering(self):
+        from plugins.platforms.discord.adapter import VoiceReceiver
+
+        receiver = VoiceReceiver.__new__(VoiceReceiver)
+        receiver._running = True
+        receiver._paused = False
+        receiver._frame_sink = None
+        receiver._lock = threading.Lock()
+        receiver._buffers = {}
+        receiver._last_packet_time = {}
+        receiver._buffer_started_at = {}
+        receiver._ssrc_to_user = {100: 42}
+
+        frames = []
+        receiver.set_frame_sink(lambda user_id, pcm: frames.append((user_id, pcm)))
+        assert receiver._frame_sink is not None
+        # Streaming must stay live during playback: pause() is ignored.
+        receiver._paused = True
+        sink = receiver._frame_sink
+        sink(42, b"\x01\x02")
+        assert frames == [(42, b"\x01\x02")]
 
 
 class TestUDPKeepalive:

@@ -2215,26 +2215,78 @@ class ShellFileOperations(FileOperations):
             glob_pattern = pattern
 
         fetch_limit = limit + offset
-        # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
-        cmd_sorted = (
-            f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
-            f"{self._escape_shell_arg(path)} 2>/dev/null "
-            f"| head -n {fetch_limit}"
-        )
-        result = self._exec(cmd_sorted, timeout=60)
-        stdout, limit_reason = _search_stdout_and_limit(result)
-        all_files = [f for f in stdout.strip().split('\n') if f]
+        limit_reason = None
 
-        if not all_files and not limit_reason:
-            # --sortr may have failed on older rg; retry without it.
+        # Home-directory scans are common when the user asks "where is project X?".
+        # Sorting every file under $HOME by mtime forces a full traversal before
+        # `head` can return and can burn the full 60s timeout on macOS hosts with
+        # Library/Downloads/media trees. Keep project-root searches sorted, but
+        # make broad home scans streaming + pruned so a simple lookup cannot stall
+        # an entire gateway turn.
+        try:
+            expanded_root = Path(path).expanduser().resolve()
+            home_root = Path.home().resolve()
+            is_broad_home_scan = expanded_root == home_root or expanded_root.parent == Path("/Users")
+        except Exception:
+            is_broad_home_scan = False
+
+        timeout = 10 if is_broad_home_scan else 60
+        if is_broad_home_scan:
+            # For home-root lookup questions, targeted project/state roots beat
+            # an unbounded rg traversal. This intentionally includes normal
+            # source/work dirs and .hermes, and excludes macOS Library/media.
+            # `find` can stream hits immediately; `rg --sortr` cannot.
+            home = Path.home()
+            candidate_roots = [
+                home / "projects",
+                home / "hermes",
+                home / ".hermes" / "hermes-agent",
+                home / ".hermes" / "projects",
+                home / ".hermes" / "skills",
+                home / ".hermes" / "scripts",
+                home / "Documents",
+            ]
+            roots = [str(r) for r in candidate_roots if r.exists()]
+            if not roots:
+                roots = [path]
+            roots_expr = " ".join(self._escape_shell_arg(r) for r in roots)
+            prune_expr = (
+                r"\( -name .git -o -name node_modules -o -name __pycache__ "
+                r"-o -path '*/Library/*' -o -path '*/Downloads/*' "
+                r"-o -path '*/Movies/*' -o -path '*/Music/*' -o -path '*/Pictures/*' "
+                r"-o -path '*/evo-runs/*' -o -path '*/worktrees/*' "
+                r"-o -path '*/kanban/*' -o -path '*/artifacts/*' "
+                r"\) -prune -o"
+            )
             cmd_plain = (
-                f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
+                f"find {roots_expr} -maxdepth 8 {prune_expr} -type f "
+                f"-iname {self._escape_shell_arg(glob_pattern)} -print 2>/dev/null "
+                f"| head -n {fetch_limit}"
+            )
+            result = self._exec(cmd_plain, timeout=timeout)
+            stdout, limit_reason = _search_stdout_and_limit(result)
+            all_files = [f for f in stdout.strip().split('\n') if f]
+        else:
+            # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
+            cmd_sorted = (
+                f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
                 f"{self._escape_shell_arg(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
-            result = self._exec(cmd_plain, timeout=60)
+            result = self._exec(cmd_sorted, timeout=timeout)
             stdout, limit_reason = _search_stdout_and_limit(result)
             all_files = [f for f in stdout.strip().split('\n') if f]
+
+            if not all_files and not limit_reason:
+                # --sortr may have failed on older rg; retry without it.
+                cmd_plain = (
+                    f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
+                    f"{self._escape_shell_arg(path)} 2>/dev/null "
+                    f"| head -n {fetch_limit}"
+                )
+                result = self._exec(cmd_plain, timeout=timeout)
+                stdout, limit_reason = _search_stdout_and_limit(result)
+                all_files = [f for f in stdout.strip().split('\n') if f]
 
         page = all_files[offset:offset + limit]
 

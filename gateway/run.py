@@ -19045,7 +19045,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if message:
                     _resume_guidance = (
                         "Address the user's NEW message below FIRST and focus "
-                        "on what the user is asking now."
+                        "on what the user is asking now. For simple recall/path/project "
+                        "questions, prefer injected memory, honcho_search/honcho_context, "
+                        "or session_search before filesystem, terminal, browser, or "
+                        "code-execution tools."
                     )
                 else:
                     _resume_guidance = (

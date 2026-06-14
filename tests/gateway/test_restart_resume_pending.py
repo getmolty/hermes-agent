@@ -162,7 +162,10 @@ def _simulate_note_injection(
         if message:
             resume_guidance = (
                 "Address the user's NEW message below FIRST and focus "
-                "on what the user is asking now."
+                "on what the user is asking now. For simple recall/path/project "
+                "questions, prefer injected memory, honcho_search/honcho_context, "
+                "or session_search before filesystem, terminal, browser, or "
+                "code-execution tools."
             )
         else:
             resume_guidance = (
@@ -521,9 +524,11 @@ class TestResumePendingSystemNote:
         )
         assert "gateway shutdown" in result
 
-    def test_resume_pending_fires_without_tool_tail(self):
-        """Key improvement over PR #9934: the restart-resume note fires
-        even when the transcript's last role is NOT ``tool``."""
+    def test_resume_pending_normal_user_message_uses_direct_answer_note(self):
+        """A fresh restart marker alone must not push a normal user turn into
+        unfinished-tool-processing mode.  This prevents simple Discord recall
+        questions after a gateway interruption from turning into broad local
+        filesystem/code searches."""
         entry = self._pending_entry()
         history = [
             {"role": "user", "content": "run a long thing", "timestamp": time.time() - 10},
@@ -533,6 +538,21 @@ class TestResumePendingSystemNote:
         assert "[System note:" in result
         assert "gateway restart" in result
         assert "NEW message" in result
+        assert "process them first" not in result
+        assert "honcho_search/honcho_context" in result
+
+    def test_resume_pending_internal_auto_resume_keeps_strong_note(self):
+        """Empty synthetic auto-resume events still need the strong recovery
+        instruction because there is no new user message to answer."""
+        entry = self._pending_entry()
+        history = [
+            {"role": "user", "content": "run a long thing", "timestamp": time.time() - 10},
+            {"role": "assistant", "content": "ok, starting...", "timestamp": time.time()},
+        ]
+        result = _simulate_note_injection(history, "", resume_entry=entry)
+        assert "[System note:" in result
+        assert "restored successfully" in result
+        assert "process them first" not in result
 
     def test_resume_pending_subsumes_tool_tail_note(self):
         """When BOTH conditions are true, the restart-resume note wins —
