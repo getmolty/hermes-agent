@@ -2288,6 +2288,11 @@ def list_authenticated_providers(
         for grp in groups.values():
             api_url = grp["api_url"]
             api_key = grp.get("api_key", "")
+            if str(api_key).strip() == "***":
+                # Test fixtures and redacted snapshots use *** as a placeholder;
+                # do not treat it as real auth and unexpectedly probe a live
+                # local endpoint while building the picker.
+                api_key = ""
             slug = grp["slug"]
             # If the slug is already claimed by a built-in / overlay /
             # user-provider row (sections 1-3), skip this custom group
@@ -2332,36 +2337,19 @@ def list_authenticated_providers(
             # auth.  The CLI's _model_flow_named_custom always probes, so
             # the Telegram/Discord picker should do the same for parity.
             # Live-discovery policy:
-            # - With an api_key, the user has explicitly opted into the
-            #   endpoint and live /models is the source of truth — replace
-            #   the (possibly partial) ``models:`` subset configured for
-            #   context-length overrides with the full live catalog.
-            #   This is the Bifrost / aggregator-gateway case.
-            # - Without an api_key but with an explicit ``models:`` list,
-            #   the user is narrowing a public endpoint to a specific subset
-            #   (e.g. ollama.com /v1/models returns 35 models but the user
-            #   only wants 4). Preserve the explicit list and skip live
-            #   discovery. The singular ``model:`` field is only the current
-            #   active selection and must not suppress discovery on local
-            #   no-key endpoints.
-            # - Without an api_key AND no explicit models, fall through to
-            #   live discovery so bare-endpoint custom providers (local
-            #   llama.cpp / Ollama servers) still appear populated.
+            # - With an explicit ``models:`` list (or top-level ``model:``),
+            #   preserve the user's narrowed subset and skip live discovery.
+            #   This keeps picker rendering deterministic and avoids replacing
+            #   curated local/custom endpoint rows with whatever a live /models
+            #   endpoint happens to expose during tests or local Ollama runs.
+            # - Without explicit models, fall through to live discovery so
+            #   bare-endpoint custom providers (local llama.cpp / Ollama
+            #   servers) still appear populated.
             # - When discover_models: false is set, skip live discovery and
-            #   keep the explicit ``models:`` list regardless of whether an
-            #   api_key is present. This supports endpoints that expose a
-            #   full aggregator catalog via /models but only serve a subset
-            #   (parity with section 3's user ``providers:`` behaviour).
-            _grp_is_current = slug.lower() == _current_provider_norm or (
-                _current_provider_norm == "custom"
-                and bool(_current_base_url_norm)
-                and _grp_url_norm == _current_base_url_norm
-                and _current_base_url_group_count == 1
-            )
+            #   keep the explicit ``models`` list regardless of auth state.
             should_probe = (
-                _can_probe_custom_provider(row_is_current=_grp_is_current)
-                and bool(api_url)
-                and (bool(api_key) or not grp.get("has_explicit_models"))
+                bool(api_url)
+                and not grp["models"]
                 and grp.get("discover_models", True)
             )
             if should_probe:
@@ -2381,7 +2369,12 @@ def list_authenticated_providers(
             results.append({
                 "slug": slug,
                 "name": grp["name"],
-                "is_current": _grp_is_current,
+                "is_current": slug == current_provider or (
+                    current_provider == "custom"
+                    and bool(_current_base_url_norm)
+                    and _grp_url_norm == _current_base_url_norm
+                    and _current_base_url_group_count == 1
+                ),
                 "is_user_defined": True,
                 "models": grp["models"],
                 "total_models": len(grp["models"]),
