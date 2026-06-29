@@ -268,6 +268,61 @@ def test_default_run_conversation_warns_without_guardrail_halt():
     assert any("repeated_exact_failure_warning" in content for content in tool_contents)
 
 
+def test_same_tool_failure_halt_guides_recovery_without_ending_turn():
+    agent = _make_agent(
+        "web_search",
+        "terminal",
+        max_iterations=10,
+        config=_hard_stop_config(
+            hard_stop_after={
+                "exact_failure": 99,
+                "same_tool_failure": 3,
+                "idempotent_no_progress": 99,
+            }
+        ),
+    )
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps({"query": f"q{i}"}), f"c-search-{i}")],
+        )
+        for i in range(1, 4)
+    ]
+    responses.append(
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("terminal", json.dumps({"command": "date"}), "c-terminal")],
+        )
+    )
+    responses.append(_mock_response(content="recovered", finish_reason="stop", tool_calls=None))
+    agent.client.chat.completions.create.side_effect = responses
+
+    def fake_tool(name, args, task_id, **kwargs):
+        if name == "web_search":
+            return json.dumps({"error": "search backend down"})
+        if name == "terminal":
+            return json.dumps({"output": "ok", "exit_code": 0})
+        return json.dumps({"error": "unexpected"})
+
+    with (
+        patch("run_agent.handle_function_call", side_effect=fake_tool) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search repeatedly, then recover")
+
+    assert mock_hfc.call_count == 4
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert "guardrail" not in result
+    assert result["final_response"] == "recovered"
+    tool_contents = [m["content"] for m in result["messages"] if m.get("role") == "tool"]
+    assert any("same_tool_failure_halt" in content for content in tool_contents)
+    assert any(m.get("tool_call_id") == "c-terminal" for m in result["messages"] if m.get("role") == "tool")
+
+
 def test_config_enabled_hard_stop_run_conversation_returns_controlled_guardrail_halt_without_top_level_error():
     agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config())
     same_args = {"query": "same"}

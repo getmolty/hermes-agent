@@ -5703,7 +5703,13 @@ class AIAgent:
         )
         if decision.action in {"warn", "halt"}:
             function_result = append_toolguard_guidance(function_result, decision)
-        if decision.should_halt:
+        # ``halt`` decisions come from after-call same-tool failure streaks:
+        # the just-finished tool result is still the correct place to tell the
+        # model to stop that failing tool path and choose a different strategy.
+        # Do not end the whole assistant turn here; otherwise the model never
+        # gets the recovery signal it needs to switch tools.  Pre-call ``block``
+        # decisions still stop the turn through _guardrail_block_result().
+        if decision.action == "block":
             self._set_tool_guardrail_halt(decision)
         return function_result
 
