@@ -42,6 +42,7 @@ def _runner(session_id: str = "sess-zai"):
     runner.session_store = MagicMock()
     runner.session_store._entries = {session_key: entry}
     runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store.get_model_override.return_value = None
     return runner, src, session_key, entry
 
 
